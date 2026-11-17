@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gestion}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gestion}
+      POSTGRES_DB: ${POSTGRES_DB:-gestion}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gestion} -d ${POSTGRES_DB:-gestion}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-gestion}:${POSTGRES_PASSWORD:-gestion}@postgres:5432/${POSTGRES_DB:-gestion}
+      RUN_MIGRATIONS: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:

@@ -1,0 +1,22 @@
+{
+  "name": "@gestion/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "start": "node src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@gestion/db": "workspace:*",
+    "@gestion/shared": "workspace:*",
+    "hono": "^4.13.19",
+    "@hono/node-server": "2.1.8"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "@types/node": "^26.6.6"
+  }
+}

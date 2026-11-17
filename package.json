@@ -1,0 +1,18 @@
+{
+  "name": "gestion-locales",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev:api": "pnpm --filter @gestion/api dev",
+    "dev:web": "pnpm --filter @gestion/web dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "db:generate": "pnpm --filter @gestion/db generate",
+    "db:migrate": "pnpm --filter @gestion/db migrate"
+  }
+}
