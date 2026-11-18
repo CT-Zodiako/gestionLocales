@@ -22,6 +22,9 @@ services:
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER:-gestion}:${POSTGRES_PASSWORD:-gestion}@postgres:5432/${POSTGRES_DB:-gestion}
       RUN_MIGRATIONS: "true"
+      # Dev-only defaults: replace both for any shared or public deployment.
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-better-auth-secret-change-me-0123456789}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:8080}
     depends_on:
       postgres:
         condition: service_healthy

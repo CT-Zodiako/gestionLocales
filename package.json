@@ -13,6 +13,7 @@
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
     "db:generate": "pnpm --filter @gestion/db generate",
-    "db:migrate": "pnpm --filter @gestion/db migrate"
+    "db:migrate": "pnpm --filter @gestion/db migrate",
+    "auth:create-user": "pnpm --filter @gestion/api auth:create-user"
   }
 }

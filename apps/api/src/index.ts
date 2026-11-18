@@ -1,29 +1,34 @@
 import { serve } from "@hono/node-server";
-import { createDb, runMigrations } from "@gestion/db";
-import { createApp } from "./app.ts";
+import { runMigrations } from "@gestion/db";
+import { readApiEnv, type ApiEnv } from "./env.ts";
+import { createServer } from "./server.ts";
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
-  console.error("DATABASE_URL is required");
+let env: ApiEnv;
+try {
+  env = readApiEnv();
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 }
-const port = Number(process.env.PORT ?? 3000);
 
-if (process.env.RUN_MIGRATIONS === "true") {
-  await runMigrations(databaseUrl);
+if (env.runMigrations) {
+  await runMigrations(env.databaseUrl);
   console.log("Migrations applied");
 }
 
-const database = createDb(databaseUrl);
-const app = createApp({ pingDatabase: database.ping });
+const server = createServer({
+  databaseUrl: env.databaseUrl,
+  authSecret: env.authSecret,
+  authUrl: env.authUrl,
+});
 
-const server = serve({ fetch: app.fetch, port }, (info) => {
+const httpServer = serve({ fetch: server.app.fetch, port: env.port }, (info) => {
   console.log(`API listening on http://localhost:${info.port}`);
 });
 
 function shutdown() {
-  server.close(() => {
-    void database.close().finally(() => process.exit(0));
+  httpServer.close(() => {
+    void server.close().finally(() => process.exit(0));
   });
 }
 process.on("SIGINT", shutdown);
