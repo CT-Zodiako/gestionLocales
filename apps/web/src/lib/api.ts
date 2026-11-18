@@ -1,6 +1,8 @@
 import {
+  type AppointmentDetailResponse,
   type HealthResponse,
   healthResponseSchema,
+  listAppointmentsResponseSchema,
   type MeResponse,
   meResponseSchema,
 } from "@gestion/shared";
@@ -53,4 +55,12 @@ export async function signOut(): Promise<void> {
     body: JSON.stringify({}),
   });
   if (!res.ok) throw new Error(`POST /api/auth/sign-out failed with ${res.status}`);
+}
+
+/** GET /api/appointments for the half-open window `[from, to)` (ISO instants); any status, ordered by start. */
+export async function fetchAppointments(from: string, to: string): Promise<AppointmentDetailResponse[]> {
+  const res = await fetch(`/api/appointments?${new URLSearchParams({ from, to })}`);
+  if (!res.ok) throw new HttpError(`GET /api/appointments failed with ${res.status}`, res.status);
+
+  return listAppointmentsResponseSchema.parse(await res.json()).appointments;
 }

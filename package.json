@@ -14,6 +14,10 @@
     "typecheck": "pnpm -r typecheck",
     "db:generate": "pnpm --filter @gestion/db generate",
     "db:migrate": "pnpm --filter @gestion/db migrate",
-    "auth:create-user": "pnpm --filter @gestion/api auth:create-user"
+    "auth:create-user": "pnpm --filter @gestion/api auth:create-user",
+    "e2e": "playwright test -c e2e/playwright.config.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1"
   }
 }

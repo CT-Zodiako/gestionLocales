@@ -1,67 +1,21 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { useNavigate } from "react-router";
-import { fetchHealth, signOut } from "../lib/api.ts";
-import { meQueryKey, meQueryOptions } from "../lib/session.ts";
+import { AgendaHeader } from "@/components/agenda/agenda-header.tsx";
+import { AgendaToolbar } from "@/components/agenda/agenda-toolbar.tsx";
+import { AgendaView } from "@/components/agenda/agenda-view.tsx";
 
+/** App shell after login: header, date navigation and the day/week agenda. */
 export function HomePage() {
-  const health = useQuery({ queryKey: ["health"], queryFn: fetchHealth });
-  const me = useQuery(meQueryOptions);
-  const queryClient = useQueryClient();
-  const navigate = useNavigate();
-  const [isSigningOut, setIsSigningOut] = useState(false);
-  const [signOutError, setSignOutError] = useState<string | null>(null);
-
-  async function handleSignOut() {
-    setIsSigningOut(true);
-    setSignOutError(null);
-    try {
-      await signOut();
-    } catch {
-      // Keep the session cache and stay here: the session may still be valid.
-      setSignOutError("No se pudo cerrar la sesión. Intenta de nuevo.");
-      setIsSigningOut(false);
-      return;
-    }
-    queryClient.removeQueries({ queryKey: meQueryKey });
-    setIsSigningOut(false);
-    await navigate("/login", { replace: true });
-  }
-
   return (
-    <main className="mx-auto flex min-h-dvh max-w-md flex-col justify-center gap-4 p-6">
-      <h1 className="text-2xl font-semibold">Gestión de citas</h1>
-
-      {me.data && (
-        <section className="flex flex-col gap-1 text-sm">
-          <p className="text-gray-600">{me.data.business.name}</p>
-          <p className="font-medium">{me.data.user.name}</p>
-          <p className="text-gray-600">{me.data.user.email}</p>
-          <button
-            type="button"
-            onClick={handleSignOut}
-            disabled={isSigningOut}
-            className="mt-2 self-start rounded border border-gray-300 px-3 py-1 disabled:opacity-50"
-          >
-            {isSigningOut ? "Saliendo…" : "Cerrar sesión"}
-          </button>
-          {signOutError && (
-            <p role="alert" className="text-red-600">
-              {signOutError}
-            </p>
-          )}
-        </section>
-      )}
-
-      <p className="text-sm text-gray-600">Estado del sistema</p>
-      {health.isPending && <p>Consultando…</p>}
-      {health.isError && <p className="text-red-600">No se pudo contactar la API.</p>}
-      {health.data && (
-        <ul className="space-y-1 text-sm">
-          <li>API: {health.data.status === "ok" ? "✅ en línea" : "⚠️ degradada"}</li>
-          <li>Base de datos: {health.data.database === "up" ? "✅ conectada" : "❌ sin conexión"}</li>
-        </ul>
-      )}
-    </main>
+    <div className="mx-auto flex h-dvh max-w-6xl flex-col">
+      <AgendaHeader />
+      <AgendaToolbar />
+      {/* Focusable so keyboard users can scroll the grid; the ring is inset because the container clips overflow. */}
+      <main
+        tabIndex={0}
+        aria-label="Agenda"
+        className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+      >
+        <AgendaView />
+      </main>
+    </div>
   );
 }

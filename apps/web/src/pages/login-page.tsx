@@ -5,7 +5,6 @@ import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { z } from "zod";
 import { HttpError, signIn } from "../lib/api.ts";
-import { meQueryKey } from "../lib/session.ts";
 
 const loginFormSchema = z.object({
   email: z.email("Ingresa un correo válido"),
@@ -31,8 +30,9 @@ export function LoginPage() {
     setFormError(null);
     try {
       await signIn(values);
-      // Drop the anonymous /api/me answer so the guard fetches the new session.
-      queryClient.removeQueries({ queryKey: meQueryKey });
+      // Drop every cached query (the anonymous /api/me answer, and anything left by a previous owner in
+      // this tab) so the guard and the agenda fetch the new session's data.
+      queryClient.clear();
       await navigate("/", { replace: true });
     } catch (error) {
       const rejected = error instanceof HttpError && (error.status === 400 || error.status === 401);
