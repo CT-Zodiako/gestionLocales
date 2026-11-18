@@ -21,7 +21,7 @@ Designed to become a multi-business product later (`business_id` everywhere), bu
 | ID | Specs | Route | Status | Commit |
 |---|---|---|---|---|
 | T1 | S3, S5 | inline | done | 5dd5a7c |
-| T2 | S6 | inline (Risk: item 2 auth) | pending | |
+| T2 | S6 | worker (Risk: item 2 auth) | done (native review blocked) | 29a1de2 |
 | T3 | S1, S7 | inline (Risk: item 4 concurrency) | pending | |
 | T4 | S2, S8 | inline | pending | |
 | T5 | S4, S9 | inline (Risk: item 2 credentials) | pending | |
@@ -36,3 +36,5 @@ Designed to become a multi-business product later (`business_id` everywhere), bu
 - L5 (user): "quiero utlizr esta tecnologias para probar , react, hono, postgrasql, docker para contenerizar todo ,drizzel orm, better auth, react hook form, tanstack query, shadcn/ui tailwind, zustand"
 - L6 (user): "si metamos zod, para la 2 que es lo general que utilia react?, 3 vale probamos" → router choice: React Router (recomendado). Authorized to create this plan and start stage 1.
 - L7 (evidence T1): api tests 3/3 pass, typecheck ok, web build ok; `docker compose up` → /api/health 200 `{"status":"ok","database":"up"}` direct and via nginx, SPA fallback 200, migration created `businesses`. `@hono/node-server` pinned to 2.1.8 (2.1.9 blocked by pnpm minimumReleaseAge). `.env.example` blocked by harness safety policy; env vars documented in README instead.
+- L8 (user): "dale" → start T2. Defaults chosen by the coordinator (change on request): email+password via Better Auth with its Drizzle adapter; public sign-up disabled; the single owner is created with a CLI (`pnpm auth:create-user`) that also ensures the business row and links the user through `business_id`; `/api/auth/*` mounted in Hono, `GET /api/me` behind a session guard; web gets `/login` (React Hook Form + Zod), protected routes and logout; shadcn/ui deferred to T4; `BETTER_AUTH_SECRET` / `BETTER_AUTH_URL` env vars with dev-only compose defaults.
+- L9 (evidence T2): writer RED→GREEN, `pnpm test` 14/14 (re-run by coordinator: 14/14), typecheck and build ok; curl via nginx: /api/me 401 → sign-in 200 + cookie → /api/me 200 {user,business} → sign-out → 401; public sign-up 400 `EMAIL_PASSWORD_SIGN_UP_DISABLED`; prod without `BETTER_AUTH_SECRET` exits 1. Independent verifier: PASS on S6/L8, no blockers. Advisories: A1 cookie not Secure over dev http (https → `__Secure-` + Secure, probed); A2 `--password` visible in `ps`/history (env `AUTH_PASSWORD` exists); A4 user with null `business_id` gets 401 on /api/me. Deviations: owner queries in `packages/db/src/owner.ts` (drizzle peer split); CLI uses a never-mounted sign-up-enabled Better Auth instance; web uses fetch instead of the better-auth client. Native review lineage `review-c172c649f18528ce` (lenses risk, reliability) blocked: reviewer model `nan/deepseek-v4-flash` exhausted its output budget on reasoning; no verdict.
