@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { createMiddleware } from "hono/factory";
 import type { ErrorResponse, HealthResponse, MeResponse } from "@gestion/shared";
+import { createAgendaRoutes, type AgendaDeps } from "./agenda-routes.ts";
 
 /** What the API needs from the auth instance; kept narrow so tests can stub it. */
 export type AuthDeps = {
@@ -16,9 +17,11 @@ export type AppDeps = {
   auth: AuthDeps;
   /** Loads the signed-in user together with its business, or null. */
   findUserWithBusiness: (userId: string) => Promise<MeResponse | null>;
+  /** Agenda data access; the agenda routes (appointments, services, opening hours) exist only when given. */
+  agenda?: AgendaDeps;
 };
 
-type SessionEnv = { Variables: { userId: string } };
+export type SessionEnv = { Variables: { userId: string } };
 
 const unauthorized = { error: "unauthorized" } satisfies ErrorResponse;
 
@@ -57,6 +60,16 @@ export function createApp(deps: AppDeps) {
 
     return c.json(me satisfies MeResponse, 200);
   });
+
+  if (deps.agenda) {
+    const agenda = createAgendaRoutes(
+      { agenda: deps.agenda, findUserWithBusiness: deps.findUserWithBusiness },
+      requireSession,
+    );
+    app.route("/appointments", agenda.appointments);
+    app.route("/services", agenda.services);
+    app.route("/opening-hours", agenda.openingHours);
+  }
 
   return app;
 }
