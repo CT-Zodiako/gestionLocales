@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
-import { createDb, findUserByEmail, removeBusinessByName, removeUserByEmail } from "@gestion/db";
+import { createDb, findBusinessByName, findUserByEmail, removeBusinessByName, removeUserByEmail } from "@gestion/db";
+import { createProvisioningAuth } from "../src/auth.ts";
 import { authSecret, authUrl, databaseUrl, uniqueEmail } from "./support/env.ts";
 
 const apiDir = fileURLToPath(new URL("..", import.meta.url));
@@ -72,5 +73,70 @@ describe("auth:create-user CLI", () => {
     const repeatedId = second.stdout.match(/Business id: (\S+)/)?.[1];
     expect(createdId).toBe(user?.businessId);
     expect(repeatedId).toBe(createdId);
+  }, 60_000);
+
+  it("reports a linked user when an existing user had no business", async () => {
+    // Given - Arrange
+    const linkedEmail = uniqueEmail("cli-linked");
+    const linkedBusiness = `Barbería ${linkedEmail}`;
+    const password = "cli-linked-password-123";
+    const auth = createProvisioningAuth({ database: database.db, secret: authSecret, baseURL: authUrl });
+    try {
+      await auth.api.signUpEmail({ body: { email: linkedEmail, password, name: "Dueño CLI" } });
+
+      // When - Act
+      const result = await runCli([
+        "--email",
+        linkedEmail,
+        "--password",
+        password,
+        "--name",
+        "Dueño CLI",
+        "--business",
+        linkedBusiness,
+      ]);
+
+      // Then - Assert
+      const user = await findUserByEmail(database.db, linkedEmail);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain(`User linked to business: ${linkedEmail}`);
+      expect(result.stdout).toContain(`Business id: ${user?.businessId}`);
+      expect(user?.businessId).not.toBeNull();
+    } finally {
+      await removeUserByEmail(database.db, linkedEmail);
+      await removeBusinessByName(database.db, linkedBusiness);
+    }
+  }, 60_000);
+
+  it("exits 1 with a one-line error and no orphan business when sign-up fails", async () => {
+    // Given - Arrange
+    const shortEmail = uniqueEmail("cli-short");
+    const shortBusiness = `Barbería ${shortEmail}`;
+    try {
+      // When - Act
+      const result = await runCli([
+        "--email",
+        shortEmail,
+        "--password",
+        "short",
+        "--name",
+        "Dueño CLI",
+        "--business",
+        shortBusiness,
+      ]);
+
+      // Then - Assert
+      expect(result.code).toBe(1);
+      // Better Auth logs its own warning line; the CLI adds exactly one error line and no stack.
+      const errorLines = result.stderr.split("\n").filter((line) => line.includes("Could not create the owner:"));
+      expect(errorLines).toEqual(["Could not create the owner: Password too short"]);
+      expect(result.stderr).not.toContain("    at ");
+      expect(result.stdout).toBe("");
+      expect(await findBusinessByName(database.db, shortBusiness)).toBeNull();
+      expect(await findUserByEmail(database.db, shortEmail)).toBeNull();
+    } finally {
+      await removeUserByEmail(database.db, shortEmail);
+      await removeBusinessByName(database.db, shortBusiness);
+    }
   }, 60_000);
 });

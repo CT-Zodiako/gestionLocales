@@ -10,16 +10,22 @@ export function HomePage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
 
   async function handleSignOut() {
     setIsSigningOut(true);
+    setSignOutError(null);
     try {
       await signOut();
-    } finally {
-      queryClient.removeQueries({ queryKey: meQueryKey });
+    } catch {
+      // Keep the session cache and stay here: the session may still be valid.
+      setSignOutError("No se pudo cerrar la sesión. Intenta de nuevo.");
       setIsSigningOut(false);
-      await navigate("/login", { replace: true });
+      return;
     }
+    queryClient.removeQueries({ queryKey: meQueryKey });
+    setIsSigningOut(false);
+    await navigate("/login", { replace: true });
   }
 
   return (
@@ -39,6 +45,11 @@ export function HomePage() {
           >
             {isSigningOut ? "Saliendo…" : "Cerrar sesión"}
           </button>
+          {signOutError && (
+            <p role="alert" className="text-red-600">
+              {signOutError}
+            </p>
+          )}
         </section>
       )}
 

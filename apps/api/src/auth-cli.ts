@@ -1,4 +1,4 @@
-import { provisionOwner } from "./create-owner.ts";
+import { provisionOwner, type CreateOwnerResult } from "./create-owner.ts";
 
 const USAGE = `Creates the single business owner.
 
@@ -8,7 +8,8 @@ Usage:
 Every option falls back to an env var, so this works too:
   AUTH_EMAIL=... AUTH_PASSWORD=... AUTH_NAME=... BUSINESS_NAME=... pnpm auth:create-user
 
-It is idempotent on email: a re-run reports the existing user and writes nothing.
+It is idempotent on email: a re-run reports the existing user and writes nothing,
+except that a user without a business is linked to it.
 
 Required env vars (same as the API): DATABASE_URL, BETTER_AUTH_SECRET, BETTER_AUTH_URL.`;
 
@@ -70,16 +71,24 @@ if ("help" in args || process.argv.includes("-h")) {
 }
 
 const owner = readOwner(args);
-const result = await provisionOwner({
-  ...owner,
-  databaseUrl: requireEnv("DATABASE_URL"),
-  authSecret: requireEnv("BETTER_AUTH_SECRET"),
-  authUrl: requireEnv("BETTER_AUTH_URL"),
-});
+const databaseUrl = requireEnv("DATABASE_URL");
+const authSecret = requireEnv("BETTER_AUTH_SECRET");
+const authUrl = requireEnv("BETTER_AUTH_URL");
+
+let result: CreateOwnerResult;
+try {
+  result = await provisionOwner({ ...owner, databaseUrl, authSecret, authUrl });
+} catch (error) {
+  const reason = error instanceof Error ? error.message : String(error);
+  fail(`Could not create the owner: ${reason.replace(/\s+/g, " ").trim()}`);
+}
 
 if (result.status === "exists") {
   console.log(`User already exists: ${owner.email}`);
   console.log(`Business id: ${result.businessId ?? "(not linked)"}`);
+} else if (result.status === "linked") {
+  console.log(`User linked to business: ${owner.email}`);
+  console.log(`Business id: ${result.businessId}`);
 } else {
   console.log(`Owner created: ${owner.email}`);
   console.log(`Business id: ${result.businessId}`);

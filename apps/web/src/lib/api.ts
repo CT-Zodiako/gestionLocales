@@ -20,6 +20,17 @@ export async function fetchMe(): Promise<MeResponse | null> {
   return meResponseSchema.parse(await res.json());
 }
 
+/** A failed HTTP call; `status` lets callers tell a rejection from an outage. */
+export class HttpError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
 export type SignInInput = {
   email: string;
   password: string;
@@ -32,7 +43,7 @@ export async function signIn(input: SignInInput): Promise<void> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   });
-  if (!res.ok) throw new Error(`POST /api/auth/sign-in/email failed with ${res.status}`);
+  if (!res.ok) throw new HttpError(`POST /api/auth/sign-in/email failed with ${res.status}`, res.status);
 }
 
 export async function signOut(): Promise<void> {

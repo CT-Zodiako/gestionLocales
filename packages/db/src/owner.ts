@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { and, eq, notExists } from "drizzle-orm";
 import type { Database } from "./client.ts";
 import { businesses, users } from "./schema.ts";
 
@@ -31,15 +31,25 @@ export async function findBusinessByName(db: Database, name: string): Promise<{ 
   return rows[0] ?? null;
 }
 
-/** Reuses the business with that name or creates it. */
-export async function ensureBusiness(db: Database, name: string): Promise<{ id: string }> {
+/** Reuses the business with that name or creates it; `created` tells which. */
+export async function ensureBusiness(db: Database, name: string): Promise<{ id: string; created: boolean }> {
   const existing = await findBusinessByName(db, name);
-  if (existing) return existing;
+  if (existing) return { id: existing.id, created: false };
 
   const inserted = await db.insert(businesses).values({ name }).returning({ id: businesses.id });
   const created = inserted[0];
   if (!created) throw new Error(`Could not create business: ${name}`);
-  return created;
+  return { id: created.id, created: true };
+}
+
+/** Deletes the business only when no user references it; used to undo a half-done provisioning. */
+export async function removeBusinessIfUnreferenced(db: Database, businessId: string): Promise<void> {
+  await db.delete(businesses).where(
+    and(
+      eq(businesses.id, businessId),
+      notExists(db.select({ id: users.id }).from(users).where(eq(users.businessId, businessId))),
+    ),
+  );
 }
 
 export async function linkUserToBusiness(db: Database, userId: string, businessId: string): Promise<void> {

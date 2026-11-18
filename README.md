@@ -64,7 +64,10 @@ pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
 
 Then open http://localhost:8080/login and sign in with that email and password.
 Re-running the command for an existing email reports `User already exists` and
-creates no duplicate. Every option also falls back to an env var, so
+creates no duplicate; if that user has no business yet (a partial earlier run),
+it is linked to the business and reported as `User linked to business`. If
+sign-up fails, the CLI prints one error line, exits 1 and removes the business
+it had just created. Every option also falls back to an env var, so
 `AUTH_EMAIL`, `AUTH_PASSWORD`, `AUTH_NAME` and `BUSINESS_NAME` work too.
 
 ## Local development

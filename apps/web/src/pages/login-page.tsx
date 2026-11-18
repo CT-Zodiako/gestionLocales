@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { z } from "zod";
-import { signIn } from "../lib/api.ts";
+import { HttpError, signIn } from "../lib/api.ts";
 import { meQueryKey } from "../lib/session.ts";
 
 const loginFormSchema = z.object({
@@ -34,8 +34,13 @@ export function LoginPage() {
       // Drop the anonymous /api/me answer so the guard fetches the new session.
       queryClient.removeQueries({ queryKey: meQueryKey });
       await navigate("/", { replace: true });
-    } catch {
-      setFormError("Correo o contraseña incorrectos.");
+    } catch (error) {
+      const rejected = error instanceof HttpError && (error.status === 400 || error.status === 401);
+      setFormError(
+        rejected
+          ? "Correo o contraseña incorrectos."
+          : "No se pudo iniciar sesión. Intenta de nuevo más tarde.",
+      );
     }
   }
 
