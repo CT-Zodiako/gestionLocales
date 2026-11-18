@@ -20,7 +20,7 @@ Designed to become a multi-business product later (`business_id` everywhere), bu
 
 | ID | Specs | Route | Status | Commit |
 |---|---|---|---|---|
-| T1 | S3, S5 | inline | in progress | |
+| T1 | S3, S5 | inline | done | 5dd5a7c |
 | T2 | S6 | inline (Risk: item 2 auth) | pending | |
 | T3 | S1, S7 | inline (Risk: item 4 concurrency) | pending | |
 | T4 | S2, S8 | inline | pending | |
@@ -35,3 +35,4 @@ Designed to become a multi-business product later (`business_id` everywhere), bu
 - L4 (user): "solo el negocio , el cliente solo va a utilizar whatsapp, por ahra un solo negocio la idea es ahcer un producto general , todavia esto pensado el stack"
 - L5 (user): "quiero utlizr esta tecnologias para probar , react, hono, postgrasql, docker para contenerizar todo ,drizzel orm, better auth, react hook form, tanstack query, shadcn/ui tailwind, zustand"
 - L6 (user): "si metamos zod, para la 2 que es lo general que utilia react?, 3 vale probamos" → router choice: React Router (recomendado). Authorized to create this plan and start stage 1.
+- L7 (evidence T1): api tests 3/3 pass, typecheck ok, web build ok; `docker compose up` → /api/health 200 `{"status":"ok","database":"up"}` direct and via nginx, SPA fallback 200, migration created `businesses`. `@hono/node-server` pinned to 2.1.8 (2.1.9 blocked by pnpm minimumReleaseAge). `.env.example` blocked by harness safety policy; env vars documented in README instead.
