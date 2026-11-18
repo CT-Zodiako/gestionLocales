@@ -70,6 +70,33 @@ sign-up fails, the CLI prints one error line, exits 1 and removes the business
 it had just created. Every option also falls back to an env var, so
 `AUTH_EMAIL`, `AUTH_PASSWORD`, `AUTH_NAME` and `BUSINESS_NAME` work too.
 
+## Data model
+
+Every table carries `business_id` (foreign key to `businesses`), so the app can
+serve several businesses later; today there is one. Schema: `packages/db/src/schema.ts`;
+data-layer functions: `packages/db/src/agenda.ts`.
+
+| Table | Contents |
+|---|---|
+| `customers` | WhatsApp customers: `phone` (E.164), optional `name`; unique per business + phone |
+| `services` | `name`, `duration_minutes` (> 0), `active` |
+| `opening_hours` | weekly ranges: `weekday` 0-6, `opens_at` < `closes_at`; several ranges per weekday |
+| `appointments` | `customer_id`, `service_id`, `starts_at` < `ends_at` (`timestamptz`), `status` `booked` or `cancelled` |
+
+An appointment can only reference a customer and a service of its own business:
+`customers` and `services` are unique on `(id, business_id)`, and `appointments`
+has composite foreign keys `(customer_id, business_id)` and `(service_id, business_id)`.
+
+No-overlap rule: each business has a single agenda, and a Postgres exclusion
+constraint (`appointments_no_overlap`, `btree_gist`) rejects two non-cancelled
+appointments of the same business whose time ranges overlap. Back-to-back
+appointments (one ends when the next starts) are allowed, and cancelling frees
+the slot. `createAppointment` maps the violation to a `SlotTakenError`.
+The constraint and the `btree_gist` extension are written by hand in
+`packages/db/migrations/0002_data_model.sql` (drizzle-kit cannot express them), so
+keep both when editing migrations and do not use `drizzle-kit push`, which does
+not know about them.
+
 ## Local development
 
 Run only Postgres in Docker and the apps on your machine:

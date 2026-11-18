@@ -1,6 +1,6 @@
 import { and, eq, notExists } from "drizzle-orm";
 import type { Database } from "./client.ts";
-import { businesses, users } from "./schema.ts";
+import { appointments, businesses, customers, openingHours, services, users } from "./schema.ts";
 
 export type OwnerRef = {
   id: string;
@@ -42,12 +42,16 @@ export async function ensureBusiness(db: Database, name: string): Promise<{ id: 
   return { id: created.id, created: true };
 }
 
-/** Deletes the business only when no user references it; used to undo a half-done provisioning. */
+/** Deletes the business only when no user or agenda table references it; used to undo a half-done provisioning. */
 export async function removeBusinessIfUnreferenced(db: Database, businessId: string): Promise<void> {
   await db.delete(businesses).where(
     and(
       eq(businesses.id, businessId),
       notExists(db.select({ id: users.id }).from(users).where(eq(users.businessId, businessId))),
+      notExists(db.select({ id: customers.id }).from(customers).where(eq(customers.businessId, businessId))),
+      notExists(db.select({ id: services.id }).from(services).where(eq(services.businessId, businessId))),
+      notExists(db.select({ id: openingHours.id }).from(openingHours).where(eq(openingHours.businessId, businessId))),
+      notExists(db.select({ id: appointments.id }).from(appointments).where(eq(appointments.businessId, businessId))),
     ),
   );
 }
