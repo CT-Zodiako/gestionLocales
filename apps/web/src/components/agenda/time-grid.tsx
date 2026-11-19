@@ -33,7 +33,7 @@ export function TimeGrid({ days, appointments }: TimeGridProps) {
               key={day}
               className={cn(
                 "sticky top-0 z-10 flex flex-col items-center border-b border-l bg-background py-1 text-xs",
-                day === today && "font-semibold text-teal-700",
+                day === today && "font-semibold text-blue-700",
               )}
               title={formatDayLabel(day)}
             >

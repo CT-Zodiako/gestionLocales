@@ -48,7 +48,7 @@ export function AppointmentBlock({ block, gridStartMin, compact }: AppointmentBl
         compact ? "py-0.5 text-[10px] leading-3" : "px-2 py-1 text-xs leading-4",
         cancelled
           ? "border-l-muted-foreground bg-muted text-muted-foreground line-through"
-          : "border-l-teal-700 bg-teal-100 text-teal-950",
+          : "border-l-blue-700 bg-blue-100 text-blue-950",
       )}
       style={{
         top: ((block.startMin - gridStartMin) * HOUR_PX) / 60,
