@@ -246,6 +246,169 @@ sign in (they wait out a 429). Failure traces go to the system temp directory
 `E2E_BASE_URL` overrides `http://localhost:8080`, and `POSTGRES_USER` /
 `POSTGRES_DB` override the database credentials used by the teardown.
 
+## WhatsApp bot
+
+Customers book, list and cancel their appointments by chatting with the business's WhatsApp number (Cloud
+API). The API receives Meta's webhook at `/api/whatsapp/webhook` and answers with a stateless menu bot
+(reply buttons and lists). Code: `apps/api/src/whatsapp/`; the webhook payload schema is in
+`packages/shared/src/whatsapp.ts`; the SQL is in `packages/db/src/whatsapp.ts`.
+
+The integration is **off by default**: with `WHATSAPP_APP_SECRET` unset the webhook routes answer `404`
+and the rest of the API is unaffected. It is built and tested with simulated traffic only; the steps
+below connect the real WhatsApp account.
+
+### Configuration
+
+| Variable | Needed | Meaning |
+|---|---|---|
+| `WHATSAPP_APP_SECRET` | yes | App secret of the Meta app; signs every delivery (`X-Hub-Signature-256`) |
+| `WHATSAPP_VERIFY_TOKEN` | yes | Any random string you choose; Meta sends it back in the subscription handshake |
+| `WHATSAPP_TOKEN` | yes | Access token used to send messages (Bearer) |
+| `WHATSAPP_PHONE_NUMBER_ID` | no | Default for `pnpm whatsapp:link`; the API itself routes by the id inside each delivery |
+| `WHATSAPP_API_VERSION` | no | Graph API version, `v23.0` by default |
+| `WHATSAPP_API_BASE_URL` | no | Graph API host, `https://graph.facebook.com` by default; only override it to point at a local stub |
+
+The three required variables must be **all set or all unset**. If only some are set, the API refuses to
+start and says which are missing (it never prints values). Empty values count as unset, so
+`docker-compose.yml` passes all of them through with empty defaults (`${WHATSAPP_APP_SECRET:-}`, ...): it
+holds no secret and no default. Put the real values in your shell or an untracked `.env` when starting the
+stack, never in a tracked file.
+
+### Connecting the real WhatsApp account (do this at the end)
+
+1. In [developers.facebook.com](https://developers.facebook.com) create an app of type **Business** and add
+   the **WhatsApp** product.
+2. **WhatsApp > API Setup**: pick the sending number (Meta provides a test number; add recipients to its
+   allow-list while testing) and copy its **Phone number ID** (digits).
+3. Create the access token. The temporary one on the same page lasts 24 hours; for a permanent one create a
+   System User in Business Settings, give it the app and the WhatsApp account, and generate a token with the
+   `whatsapp_business_messaging` permission. This is `WHATSAPP_TOKEN`.
+4. **App settings > Basic > App secret** (Show): this is `WHATSAPP_APP_SECRET`.
+5. Invent a verify token, for example `openssl rand -hex 24`: this is `WHATSAPP_VERIFY_TOKEN`.
+6. Start the stack with those three variables set (and a public **HTTPS** URL pointing at it; Meta does not call
+   plain HTTP or self-signed certificates):
+   ```bash
+   WHATSAPP_APP_SECRET=... WHATSAPP_VERIFY_TOKEN=... WHATSAPP_TOKEN=... docker compose up -d
+   ```
+7. Register the number for your business (the owner must exist, see "Create the owner user"):
+   ```bash
+   pnpm whatsapp:link --email owner@example.com --phone-number-id <Phone number ID>
+   # Docker stack: docker compose exec api node apps/api/src/whatsapp-link-cli.ts --email ... --phone-number-id ...
+   ```
+   From the host it needs `DATABASE_URL` exported (see "Local development"); `AUTH_EMAIL` and
+   `WHATSAPP_PHONE_NUMBER_ID` work as fallbacks for the two options.
+   It is idempotent (`WhatsApp number linked` / `WhatsApp number already linked`), and a number that belongs
+   to another business is refused (exit 1). Messages for a number that is not registered are ignored.
+8. **WhatsApp > Configuration > Webhook**: Callback URL `https://<host>/api/whatsapp/webhook`, Verify token = your
+   `WHATSAPP_VERIFY_TOKEN`, then *Verify and save*. Then, under *Webhook fields*, **subscribe to `messages`**.
+9. Add services and opening hours (the agenda API or the PWA), and send "hola" to the number from a phone.
+
+Replies are sent inside the 24-hour customer-service window that each incoming message opens, so no message
+template is needed; reminders (templates) are a later stage.
+
+### Conversation
+
+The bot keeps no state: the state travels in the ids of the buttons and list rows, and every id is parsed
+and checked against the database on every step (a forged or stale id, another business's service, a past slot
+or someone else's appointment is answered with "Esa opción ya no es válida." and the main menu; nothing changes).
+The customer is identified only by the sender number (`from`); a customer sees and cancels only their own
+appointments.
+
+| Customer | Bot |
+|---|---|
+| any text (or an unknown id) | main menu: reply buttons **Agendar**, **Mis citas**, **Cancelar** |
+| Agendar | list of active services (`svc:<id>`); with more than 10, 9 services plus a **Más servicios** row (`svcs:<offset>`) for the next page |
+| a service | list of the next 7 days that have opening hours and free slots (`day:<service>:<date>`) |
+| a day | list of free slots, 10 rows per page; with more, 9 slots plus **Más horarios** (`more:...`) |
+| a slot | confirmation buttons **Confirmar** / **Otro horario** / **Menú** |
+| Confirmar | the appointment is created and confirmed, with the menu again. If it is already the customer's own booking of that service at that time (a repeated confirmation, a stale button, a concurrent duplicate) the bot says "Ya tienes esa cita agendada" and creates nothing; if someone else took it, "Ese horario se acaba de ocupar" |
+| Mis citas | the customer's upcoming booked appointments, 10 per page; with more, a **Ver más citas** button (`mine:<offset>`) shows the next page |
+| Cancelar | list of the customer's upcoming appointments, 9 plus a **Más citas** row (`cmore:<offset>`) when there are more than 10, then **Sí, cancelar** / **No, volver** |
+
+Slots come from `opening_hours` minus booked appointments, in the business timezone (`businesses.timezone`,
+IANA name, `America/Bogota` by default), stepping by the service duration, never in the past, and computed
+with `Intl.DateTimeFormat` (`apps/api/src/whatsapp/availability.ts`), so daylight-saving days have their real
+length. The booking still goes through `createAppointment`: if someone took the slot meanwhile the
+exclusion constraint rejects it and the customer gets "Ese horario se acaba de ocupar." with the slots again.
+Paging offsets are plain numbers (at most 4 digits) validated like every other id: a stale offset starts the list over and a malformed one is refused. All reply ids stay far below WhatsApp's 200-character limit. Without active services, without opening hours or without free slots the bot says so. Not built: reminders,
+payments, media, free-text understanding, human handoff. There is no limit on how many appointments one
+number can book.
+
+WhatsApp limits respected by the message builders (`apps/api/src/whatsapp/messages.ts`; longer text is cut with
+an ellipsis `…`): button title 20 characters, at most 3 buttons, list row title 24, row description 72, list
+button label 20, section title 24, at most 10 rows per list, header and footer 60, interactive body 1024, text
+body 4096, reply ids 200 (rows) and 256 (buttons).
+
+### What the webhook answers
+
+- `GET /api/whatsapp/webhook`: the subscription handshake. With `hub.mode=subscribe` and the right
+  `hub.verify_token` (constant-time comparison) it echoes `hub.challenge` as plain text; anything else is `403`.
+- `POST /api/whatsapp/webhook`: the signature of the **raw body** (`X-Hub-Signature-256`, HMAC-SHA256 with the
+  app secret, constant-time comparison, exactly 64 hex digits) is verified before anything is parsed. A
+  missing or wrong signature is `401` and nothing is processed (so is any signature when `WHATSAPP_APP_SECRET` is empty; an empty `WHATSAPP_VERIFY_TOKEN` makes the handshake `403`, as a defense in depth if the routes are mounted without the startup checks). A body over 1 MB is `413`. A correctly signed
+  body that is not JSON is `400`. Every other signed delivery is `200`, including status updates (delivery and
+  read receipts), unsupported message types (images, audio, location, ...), messages from numbers that are not
+  8 to 15 digits and messages for an unregistered `phone_number_id`: they are ignored.
+- These two routes are not behind the session guard (Meta calls them); every other route still is.
+
+### Idempotency and failed sends
+
+Meta retries deliveries and can send duplicates. Each message id (`wamid`) is stored in
+`whatsapp_processed_messages` (primary key, `business_id`, `received_at`) with an atomic
+`INSERT ... ON CONFLICT DO NOTHING` **before** the message is handled, so a repeated or concurrent delivery
+of the same `wamid` does nothing: one booking, one confirmation, however many copies arrive.
+
+If handling or sending the reply fails after the marker was stored:
+
+- **Nothing had been changed** (menus, lists, a refusal, a slot that was taken): the marker is removed and the
+  delivery is answered `503`, so Meta's retry reprocesses the message. Meta keeps retrying with backoff, so a
+  permanently broken token produces repeated `503`s until it is fixed.
+- **A booking or cancellation was already applied**: the marker stays and the delivery is answered `200`, so a
+  retry can never book or cancel twice. The customer does not get the confirmation message in that case
+  (it is logged as an error); "Mis citas" shows the result.
+
+Known limit: if the process dies between storing the marker and finishing, that one message is neither
+retried nor answered; the customer simply writes again.
+
+### Logs
+
+Logs hold message ids, masked numbers (`***4567`) and error kinds. They never include tokens, secrets, message
+bodies or full phone numbers. Rejected (unsigned or wrongly signed) deliveries are logged as a warning at most once a
+minute, with a `suppressed` count of how many were held back since the previous line, so unauthenticated traffic
+cannot flood the logs.
+
+### Simulate traffic locally (signed curl)
+
+Use a throwaway secret, never the real one. Send outgoing messages to a local stub instead of Meta by setting
+`WHATSAPP_API_BASE_URL` (Docker Desktop reaches the host at `host.docker.internal`):
+
+```bash
+# 1. a stub that prints what the bot would send to WhatsApp
+node -e 'require("http").createServer((q,s)=>{let b="";q.on("data",c=>b+=c).on("end",()=>{console.log(q.method,q.url,b);s.setHeader("content-type","application/json");s.end("{\"messages\":[{\"id\":\"wamid.stub\"}]}")})}).listen(9999)' &
+
+# 2. the stack with throwaway values and the stub as Graph API
+WHATSAPP_APP_SECRET=throwaway-secret WHATSAPP_VERIFY_TOKEN=throwaway-verify WHATSAPP_TOKEN=throwaway-token \
+  WHATSAPP_API_BASE_URL=http://host.docker.internal:9999 docker compose up -d
+
+# 3. a business with an owner (see "Create the owner user"), its number and some data
+pnpm whatsapp:link --email owner@example.com --phone-number-id 123456789012345
+
+# 4. the handshake
+curl -s "http://localhost:8080/api/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=throwaway-verify&hub.challenge=12345"   # 12345
+
+# 5. a signed message from a customer (wamid must be unique per message; the same wamid twice is ignored)
+BODY='{"object":"whatsapp_business_account","entry":[{"id":"1","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"phone_number_id":"123456789012345"},"messages":[{"from":"573001234567","id":"wamid.demo-1","type":"text","text":{"body":"hola"}}]}}]}]}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac 'throwaway-secret' -hex | sed 's/^.* //')
+curl -i -X POST http://localhost:8080/api/whatsapp/webhook \
+  -H 'content-type: application/json' -H "X-Hub-Signature-256: sha256=$SIG" --data-binary "$BODY"   # 200, the stub prints the menu
+```
+
+To tap a button, send an `interactive` message instead of `text`:
+`{"from":"573001234567","id":"wamid.demo-2","type":"interactive","interactive":{"type":"button_reply","button_reply":{"id":"menu:book","title":"Agendar"}}}`
+(`list_reply` for list rows). Take the ids from the stub's output. A wrong or missing signature is `401`.
+Afterwards restart the stack without the variables (`docker compose up -d`) and remove the test business
+rows if you created any.
+
 ## Data model
 
 Every table carries `business_id` (foreign key to `businesses`), so the app can
@@ -258,6 +421,8 @@ data-layer functions: `packages/db/src/agenda.ts`.
 | `services` | `name`, `duration_minutes` (> 0), `active` |
 | `opening_hours` | weekly ranges: `weekday` 0-6, `opens_at` < `closes_at`; several ranges per weekday |
 | `appointments` | `customer_id`, `service_id`, `starts_at` < `ends_at` (`timestamptz`), `status` `booked` or `cancelled` |
+| `whatsapp_channels` | WhatsApp `phone_number_id` (unique) of a business; routes webhook messages to it |
+| `whatsapp_processed_messages` | one row per handled WhatsApp `wamid` (primary key): the webhook's idempotency marker |
 
 An appointment can only reference a customer and a service of its own business:
 `customers` and `services` are unique on `(id, business_id)`, and `appointments`
@@ -309,6 +474,9 @@ pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
 | `BETTER_AUTH_TRUSTED_ORIGINS` | api (Better Auth, optional) | comma-separated extra origins allowed for cookie requests |
 | `AUTH_EMAIL` / `AUTH_PASSWORD` / `AUTH_NAME` / `BUSINESS_NAME` | auth CLI | none; env fallbacks for the CLI flags |
 | `API_URL` | web dev server proxy | `http://localhost:3000` |
+| `WHATSAPP_APP_SECRET` / `WHATSAPP_VERIFY_TOKEN` / `WHATSAPP_TOKEN` | api | none (all three unset disables the WhatsApp webhook; some but not all refuses to start); empty in compose |
+| `WHATSAPP_PHONE_NUMBER_ID` | api (informational), whatsapp:link CLI | none; empty in compose |
+| `WHATSAPP_API_VERSION` / `WHATSAPP_API_BASE_URL` | api | `v23.0` / `https://graph.facebook.com`; empty in compose |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | `gestion` |
 | `POSTGRES_PORT` | compose (host port) | `5433` |
 
@@ -325,3 +493,4 @@ The compose defaults are for local development only. Set real values for any sha
 | `pnpm db:generate --name <name>` | Create a migration from `packages/db/src/schema.ts` |
 | `pnpm db:migrate` | Apply migrations to `DATABASE_URL` |
 | `pnpm auth:create-user --email <e> --password <p> --name <n> --business <b>` | Create the single owner (idempotent on email) |
+| `pnpm whatsapp:link --email <e> --phone-number-id <id>` | Register a WhatsApp phone number id for the owner's business (idempotent; see "WhatsApp bot") |
