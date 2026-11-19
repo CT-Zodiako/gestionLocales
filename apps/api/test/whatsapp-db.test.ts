@@ -3,6 +3,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   cancelUpcomingAppointmentForPhone,
   claimWhatsappMessage,
+  completeWhatsappMessage,
   createAppointment,
   createDb,
   createService,
@@ -11,6 +12,7 @@ import {
   findBusinessByName,
   findUpcomingAppointmentForPhone,
   findWhatsappChannel,
+  getWhatsappMessageMarker,
   linkWhatsappChannel,
   listUpcomingAppointmentsForPhone,
   releaseWhatsappMessage,
@@ -93,6 +95,73 @@ describe("WhatsApp data layer", () => {
       expect(await claimWhatsappMessage(db, { wamid, businessId: business })).toBe(false);
       await releaseWhatsappMessage(db, wamid);
       expect(await claimWhatsappMessage(db, { wamid, businessId: business })).toBe(true);
+    });
+
+    it("stores an uncompleted marker, and completing it records the time", async () => {
+      const business = await newBusiness();
+      const wamid = `wamid.${randomUUID()}`;
+
+      expect(await getWhatsappMessageMarker(db, wamid)).toBeNull();
+      await claimWhatsappMessage(db, { wamid, businessId: business });
+      expect(await getWhatsappMessageMarker(db, wamid)).toMatchObject({ businessId: business, completedAt: null });
+
+      await completeWhatsappMessage(db, wamid);
+
+      const marker = await getWhatsappMessageMarker(db, wamid);
+      expect(marker?.completedAt).toBeInstanceOf(Date);
+      expect(marker?.completedAt?.getTime()).toBeGreaterThanOrEqual(marker?.receivedAt.getTime() ?? Infinity);
+    });
+
+    it("refuses a claim inside the lease (default 2 minutes) and takes an expired uncompleted marker over once", async () => {
+      const business = await newBusiness();
+      const wamid = `wamid.${randomUUID()}`;
+      await claimWhatsappMessage(db, { wamid, businessId: business });
+      const claimedAt = (await getWhatsappMessageMarker(db, wamid))?.receivedAt.getTime() ?? 0;
+
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business })).toBe(false);
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 60_000 })).toBe(false);
+      expect((await getWhatsappMessageMarker(db, wamid))?.receivedAt.getTime()).toBe(claimedAt);
+
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 0 })).toBe(true);
+      const takenOver = await getWhatsappMessageMarker(db, wamid);
+      expect(takenOver?.receivedAt.getTime()).toBeGreaterThan(claimedAt);
+      expect(takenOver?.completedAt).toBeNull();
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business })).toBe(false);
+    });
+
+    it("honours a short injected lease after it elapses", async () => {
+      const business = await newBusiness();
+      const wamid = `wamid.${randomUUID()}`;
+      await claimWhatsappMessage(db, { wamid, businessId: business });
+
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 100 })).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 100 })).toBe(true);
+    });
+
+    it("never takes over a completed marker", async () => {
+      const business = await newBusiness();
+      const wamid = `wamid.${randomUUID()}`;
+      await claimWhatsappMessage(db, { wamid, businessId: business });
+      await completeWhatsappMessage(db, wamid);
+
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 0 })).toBe(false);
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business })).toBe(false);
+    });
+
+    it("lets exactly one of 20 concurrent claims take an expired marker over", async () => {
+      const business = await newBusiness();
+      const wamid = `wamid.${randomUUID()}`;
+      await claimWhatsappMessage(db, { wamid, businessId: business });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const claims = await Promise.all(Array.from({ length: 20 }, () => claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 150 })));
+
+      expect(claims.filter(Boolean)).toHaveLength(1);
+    });
+
+    it("completing an unknown message is a no-op", async () => {
+      await completeWhatsappMessage(db, `wamid.${randomUUID()}`);
     });
   });
 

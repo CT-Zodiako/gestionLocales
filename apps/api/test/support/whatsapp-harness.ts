@@ -1,19 +1,35 @@
 import { randomUUID } from "node:crypto";
+import { Hono } from "hono";
 import {
+  cancelUpcomingAppointmentForPhone,
+  claimWhatsappMessage,
+  completeWhatsappMessage,
   createAppointment,
   createService,
   ensureBusiness,
+  findBookedAppointmentForPhoneAt,
+  findService,
+  findUpcomingAppointmentForPhone,
+  findWhatsappChannel,
+  getWhatsappMessageMarker,
   linkWhatsappChannel,
   listAppointmentDetails,
+  listAppointments,
+  listOpeningHours,
+  listServices,
+  listUpcomingAppointmentsForPhone,
+  releaseWhatsappMessage,
   removeBusinessWithAgenda,
   setBusinessTimezone,
   setOpeningHours,
   upsertCustomer,
   type AppointmentDetail,
+  type Database,
   type schema,
 } from "@gestion/db";
 import { createServer, type Server } from "../../src/server.ts";
 import type { OutgoingMessage } from "../../src/whatsapp/messages.ts";
+import { createWhatsAppRoutes, type WhatsAppStore } from "../../src/whatsapp/webhook-routes.ts";
 import { authSecret, authUrl, databaseUrl } from "./env.ts";
 import {
   APP_SECRET,
@@ -32,8 +48,37 @@ export const WEBHOOK = "/api/whatsapp/webhook";
 /** Monday 2031-03-10 08:00 in Bogotá (UTC-5). */
 export const MONDAY_MORNING = new Date("2031-03-10T13:00:00.000Z");
 
+/**
+ * Knobs of a controlled harness: the webhook runs against a store that wraps the real data layer so a test can
+ * shorten the lease and make individual store operations fail.
+ */
+export interface Controls {
+  /** Lease used by `claimMessage`; `0` makes every uncompleted marker immediately takeable. */
+  leaseMs: number;
+  fail: {
+    /** Number of upcoming `findChannel` calls that throw (`Infinity` for all). */
+    findChannel: number;
+    /** Message ids whose claim throws. */
+    claimWamids: Set<string>;
+    /** Number of upcoming `releaseMessage` calls that throw. */
+    release: number;
+    /** Number of upcoming `completeMessage` calls that throw. */
+    complete: number;
+  };
+  calls: { release: number; complete: number };
+}
+
+export interface HarnessOptions {
+  /** Route the webhook through a fault-injecting store (see `Controls`). */
+  controlled?: boolean;
+}
+
 export interface Harness {
   server: Server;
+  /** Present only for `createHarness({ controlled: true })`. */
+  controls: Controls;
+  /** Stored idempotency marker of a message id, or null. */
+  marker: (wamid: string) => Promise<{ businessId: string; receivedAt: Date; completedAt: Date | null } | null>;
   client: FakeWhatsAppClient;
   /** Replaceable clock: every date the bot reasons about derives from it. */
   clock: { now: Date };
@@ -78,7 +123,48 @@ export interface Customer {
   inbox: () => OutgoingMessage[];
 }
 
-export async function createHarness(): Promise<Harness> {
+function spend(fail: Controls["fail"], key: "findChannel" | "release" | "complete"): void {
+  if (fail[key] > 0) {
+    fail[key] -= 1;
+    throw new Error(`simulated ${key} failure`);
+  }
+}
+
+/** The production store wiring, with the faults and the lease of `controls` applied. */
+function controlledStore(db: Database, controls: Controls): WhatsAppStore {
+  return {
+    findChannel: async (phoneNumberId) => {
+      spend(controls.fail, "findChannel");
+      return findWhatsappChannel(db, phoneNumberId);
+    },
+    claimMessage: async (input, options) => {
+      if (controls.fail.claimWamids.has(input.wamid)) throw new Error("simulated claim failure");
+      return claimWhatsappMessage(db, input, { leaseMs: controls.leaseMs, ...options });
+    },
+    releaseMessage: async (wamid) => {
+      controls.calls.release += 1;
+      spend(controls.fail, "release");
+      return releaseWhatsappMessage(db, wamid);
+    },
+    completeMessage: async (wamid) => {
+      controls.calls.complete += 1;
+      spend(controls.fail, "complete");
+      return completeWhatsappMessage(db, wamid);
+    },
+    listServices: (businessId) => listServices(db, businessId),
+    findService: (businessId, serviceId) => findService(db, businessId, serviceId),
+    listOpeningHours: (businessId) => listOpeningHours(db, businessId),
+    listAppointments: (input) => listAppointments(db, input),
+    upsertCustomer: (input) => upsertCustomer(db, input),
+    createAppointment: (input) => createAppointment(db, input),
+    findBookedAppointmentForPhoneAt: (input) => findBookedAppointmentForPhoneAt(db, input),
+    listUpcomingAppointmentsForPhone: (input) => listUpcomingAppointmentsForPhone(db, input),
+    findUpcomingAppointmentForPhone: (input) => findUpcomingAppointmentForPhone(db, input),
+    cancelUpcomingAppointmentForPhone: (input) => cancelUpcomingAppointmentForPhone(db, input),
+  };
+}
+
+export async function createHarness(harnessOptions: HarnessOptions = {}): Promise<Harness> {
   const client = new FakeWhatsAppClient();
   const clock = { now: MONDAY_MORNING };
   const logs: string[] = [];
@@ -98,9 +184,29 @@ export async function createHarness(): Promise<Harness> {
     },
   });
   const businessIds: string[] = [];
+  const controls: Controls = {
+    leaseMs: 120_000,
+    fail: { findChannel: 0, claimWamids: new Set(), release: 0, complete: 0 },
+    calls: { release: 0, complete: 0 },
+  };
+  const controlled = harnessOptions.controlled
+    ? new Hono().route(
+        "/api/whatsapp",
+        createWhatsAppRoutes({
+          appSecret: APP_SECRET,
+          verifyToken: VERIFY_TOKEN,
+          client,
+          now: () => clock.now,
+          logger: { info: capture("info"), warn: capture("warn"), error: capture("error") },
+          store: controlledStore(server.db, controls),
+        }),
+      )
+    : undefined;
 
   const harness: Harness = {
     server,
+    controls,
+    marker: (wamid) => getWhatsappMessageMarker(server.db, wamid),
     client,
     clock,
     logs,
@@ -111,7 +217,7 @@ export async function createHarness(): Promise<Harness> {
       const headers: Record<string, string> = { "content-type": "application/json" };
       const signature = options.signature === undefined ? sign(raw) : options.signature;
       if (signature !== null) headers["x-hub-signature-256"] = signature;
-      return await server.app.request(WEBHOOK, { method: "POST", headers, body: raw });
+      return await (controlled ?? server.app).request(WEBHOOK, { method: "POST", headers, body: raw });
     },
     close: async () => {
       for (const id of businessIds) await removeBusinessWithAgenda(server.db, id);

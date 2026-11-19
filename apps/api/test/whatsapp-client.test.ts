@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createFetchWhatsAppClient, DEFAULT_GRAPH_BASE_URL, WhatsAppSendError } from "../src/whatsapp/client.ts";
+import { createFetchWhatsAppClient, DEFAULT_GRAPH_BASE_URL, isPermanentSendError, WhatsAppSendError } from "../src/whatsapp/client.ts";
 import { textMessage } from "../src/whatsapp/messages.ts";
 import { ACCESS_TOKEN } from "./support/whatsapp.ts";
 
@@ -89,5 +89,43 @@ describe("createFetchWhatsAppClient", () => {
       client.sendMessage({ phoneNumberId: "../../other", message: textMessage("573001234567", "Hola") }),
     ).rejects.toThrow();
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("isPermanentSendError", () => {
+  it.each([400, 401, 403, 404, 410, 422, 499])("treats HTTP %i as permanent", (status) => {
+    expect(isPermanentSendError(new WhatsAppSendError(status))).toBe(true);
+  });
+
+  it.each([408, 429, 500, 502, 503, 504])("treats HTTP %i as transient", (status) => {
+    expect(isPermanentSendError(new WhatsAppSendError(status))).toBe(false);
+  });
+
+  it.each<[string, unknown]>([
+    ["a network error", new TypeError("fetch failed")],
+    ["a timeout", new DOMException("timed out", "TimeoutError")],
+    ["a plain error", new Error("boom")],
+    ["a non-error", "boom"],
+    ["undefined", undefined],
+  ])("treats %s as transient", (_name, error) => {
+    expect(isPermanentSendError(error)).toBe(false);
+  });
+
+  it("classifies what the real client throws: a 401 response is permanent, a 500 response and a network failure are not", async () => {
+    const respond = (status: number) =>
+      createFetchWhatsAppClient({ token: ACCESS_TOKEN, apiVersion: "v23.0", fetch: async () => Response.json({ error: { code: 190 } }, { status }) });
+    const network = createFetchWhatsAppClient({
+      token: ACCESS_TOKEN,
+      apiVersion: "v23.0",
+      fetch: async () => {
+        throw new TypeError("fetch failed");
+      },
+    });
+    const input = { phoneNumberId: "42", message: textMessage("573001234567", "Hola") };
+    const failure = (client: ReturnType<typeof createFetchWhatsAppClient>) => client.sendMessage(input).catch((error: unknown) => error);
+
+    expect(isPermanentSendError(await failure(respond(401)))).toBe(true);
+    expect(isPermanentSendError(await failure(respond(500)))).toBe(false);
+    expect(isPermanentSendError(await failure(network))).toBe(false);
   });
 });

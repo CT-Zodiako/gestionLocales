@@ -86,8 +86,12 @@ export class FakeWhatsAppClient implements WhatsAppClient {
   readonly sent: SentMessage[] = [];
   /** Number of upcoming `sendMessage` calls that reject. */
   failures = 0;
+  /** Specific errors the next `sendMessage` calls reject with, in order (before `failures` applies). */
+  errors: Error[] = [];
 
   async sendMessage(input: SentMessage): Promise<void> {
+    const next = this.errors.shift();
+    if (next) throw next;
     if (this.failures > 0) {
       this.failures -= 1;
       throw new Error("simulated send failure");

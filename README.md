@@ -353,22 +353,37 @@ body 4096, reply ids 200 (rows) and 256 (buttons).
 
 ### Idempotency and failed sends
 
-Meta retries deliveries and can send duplicates. Each message id (`wamid`) is stored in
-`whatsapp_processed_messages` (primary key, `business_id`, `received_at`) with an atomic
-`INSERT ... ON CONFLICT DO NOTHING` **before** the message is handled, so a repeated or concurrent delivery
-of the same `wamid` does nothing: one booking, one confirmation, however many copies arrive.
+Meta retries deliveries and can send duplicates. Each message id (`wamid`) is claimed in
+`whatsapp_processed_messages` (primary key, `business_id`, `received_at`, `completed_at`) with one atomic
+`INSERT ... ON CONFLICT DO UPDATE ... WHERE` **before** the message is handled, so a repeated or concurrent
+delivery of the same `wamid` does nothing: one booking, one confirmation, however many copies arrive.
 
-If handling or sending the reply fails after the marker was stored:
+The marker is also a **lease** of 2 minutes. A marker is *completed* (`completed_at` set) once handling ended
+without needing a retry. A completed marker is never taken over. A marker that is not completed and whose
+`received_at` is older than the lease (the process died after claiming it, or the marker could not be released)
+is taken over by the next delivery of that `wamid`, atomically and by exactly one caller; inside the lease that
+delivery is a duplicate (`200`, nothing sent) because another one may still be in flight. So a crash or a failed
+release delays the message until Meta's next retry instead of losing it.
 
-- **Nothing had been changed** (menus, lists, a refusal, a slot that was taken): the marker is removed and the
-  delivery is answered `503`, so Meta's retry reprocesses the message. Meta keeps retrying with backoff, so a
-  permanently broken token produces repeated `503`s until it is fixed.
-- **A booking or cancellation was already applied**: the marker stays and the delivery is answered `200`, so a
-  retry can never book or cancel twice. The customer does not get the confirmation message in that case
+If handling or sending the reply fails after the marker was claimed:
+
+- **A booking or cancellation was already applied**: the marker is completed and the delivery is answered `200`,
+  so a retry can never book or cancel twice. The customer does not get the confirmation message in that case
   (it is logged as an error); "Mis citas" shows the result.
+- **Nothing had been changed and the send error is permanent** (the Graph API answered `4xx` other than `408` and
+  `429`: an invalid or expired token `401`/`403`, a rejected body `400`, an unknown phone number id `404`): resending
+  cannot help, so the marker is completed, an error line is logged (no token, no full phone number) and the
+  delivery is answered `200`; Meta does not retry. The customer gets no reply until the cause is fixed (check the
+  logs for `permanent send error`), and that message is not answered later.
+- **Nothing had been changed and the error is transient** (network error, timeout, `5xx`, `408`, `429`, a database
+  error): the marker is removed and the delivery is answered `503`, so Meta's retry reprocesses the message. If
+  removing the marker fails it is tried twice more; if it still fails, the marker stays uncompleted and the
+  lease lets Meta's retry after 2 minutes take over (the earlier retries inside the lease are answered `200`
+  without a reply).
 
-Known limit: if the process dies between storing the marker and finishing, that one message is neither
-retried nor answered; the customer simply writes again.
+Completing a marker is retried the same way; if it still fails the marker stays uncompleted, so a delivery after
+the lease can handle the message again (a repeated reply is possible; a repeated booking is not, because the bot
+reports "Ya tienes esa cita agendada").
 
 ### Logs
 
@@ -422,7 +437,7 @@ data-layer functions: `packages/db/src/agenda.ts`.
 | `opening_hours` | weekly ranges: `weekday` 0-6, `opens_at` < `closes_at`; several ranges per weekday |
 | `appointments` | `customer_id`, `service_id`, `starts_at` < `ends_at` (`timestamptz`), `status` `booked` or `cancelled` |
 | `whatsapp_channels` | WhatsApp `phone_number_id` (unique) of a business; routes webhook messages to it |
-| `whatsapp_processed_messages` | one row per handled WhatsApp `wamid` (primary key): the webhook's idempotency marker |
+| `whatsapp_processed_messages` | one row per WhatsApp `wamid` (primary key): the webhook's idempotency marker and 2-minute lease (`completed_at` is set when handling finished) |
 
 An appointment can only reference a customer and a service of its own business:
 `customers` and `services` are unique on `(id, business_id)`, and `appointments`

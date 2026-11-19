@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { claimWhatsappMessage } from "@gestion/db";
+import { WhatsAppSendError } from "../src/whatsapp/client.ts";
 import { createServer, type Server } from "../src/server.ts";
 import { createWhatsAppRoutes, type WhatsAppStore } from "../src/whatsapp/webhook-routes.ts";
 import { authSecret, authUrl, databaseUrl } from "./support/env.ts";
@@ -245,6 +247,17 @@ describe("WhatsApp webhook", () => {
   });
 
   describe("idempotency per wamid", () => {
+    it("marks a handled message as completed, so a lease can never take it over", async () => {
+      const wamid = newWamid();
+
+      const res = await harness.post(textPayload(options(wamid), "hola"));
+
+      expect(res.status).toBe(200);
+      const marker = await harness.marker(wamid);
+      expect(marker?.businessId).toBe(tenant.businessId);
+      expect(marker?.completedAt).toBeInstanceOf(Date);
+    });
+
     it("answers a repeated message once when it is sent again sequentially", async () => {
       const payload = textPayload(options(), "hola");
       const before = sentCount();
@@ -521,5 +534,299 @@ describe("createWhatsAppRoutes with an empty secret", () => {
     const res = await app.request(`/webhook?${new URLSearchParams({ "hub.mode": "subscribe", "hub.verify_token": VERIFY_TOKEN, "hub.challenge": "42" })}`);
 
     expect(await res.text()).toBe("42");
+  });
+});
+
+describe("WhatsApp webhook: lease on the message marker", () => {
+  let harness: Harness;
+  let tenant: Tenant;
+
+  beforeAll(async () => {
+    harness = await createHarness({ controlled: true });
+    tenant = await harness.newTenant();
+  });
+
+  afterAll(async () => {
+    await harness.close();
+  });
+
+  const options = (wamid: string, from = "573002220001") => ({ phoneNumberId: tenant.phoneNumberId, from, wamid });
+  const sentCount = () => harness.client.sent.length;
+  const serviceId = () => tenant.serviceIds[0] ?? "";
+  const confirm = (wamid: string, phone: string, startsAt: string) =>
+    JSON.stringify(replyPayload(options(wamid, phone), `ok:${serviceId()}:${startsAt}`, "button_reply"));
+  const reset = () => {
+    harness.controls.leaseMs = 120_000;
+    harness.controls.fail.findChannel = 0;
+    harness.controls.fail.claimWamids.clear();
+    harness.controls.fail.release = 0;
+    harness.controls.fail.complete = 0;
+    harness.client.failures = 0;
+    harness.client.errors = [];
+  };
+
+  describe("when the marker release fails after a failure that changed nothing", () => {
+    it("keeps an uncompleted marker, treats a retry inside the lease as a duplicate and processes the first retry after it", async () => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      harness.client.failures = 1;
+      harness.controls.fail.release = Number.POSITIVE_INFINITY;
+      harness.controls.calls.release = 0;
+
+      const failed = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(503);
+      expect(harness.controls.calls.release).toBe(3); // the first attempt plus two retries
+      expect(await harness.marker(wamid)).toMatchObject({ completedAt: null });
+      expect(harness.logs.some((line) => line.startsWith("error") && line.includes("could not remove the message marker"))).toBe(true);
+
+      const insideLease = await harness.post(null, { raw });
+      expect(insideLease.status).toBe(200);
+      expect(sentCount()).toBe(before);
+      expect(await harness.marker(wamid)).toMatchObject({ completedAt: null });
+
+      harness.controls.leaseMs = 0;
+      const afterLease = await harness.post(null, { raw });
+      expect(afterLease.status).toBe(200);
+      expect(sentCount()).toBe(before + 1);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+
+      const again = await harness.post(null, { raw });
+      expect(again.status).toBe(200);
+      expect(sentCount()).toBe(before + 1);
+    });
+
+    it("retries the release and removes the marker when it succeeds on a later attempt", async () => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      harness.client.failures = 1;
+      harness.controls.fail.release = 2;
+      harness.controls.calls.release = 0;
+
+      const failed = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(503);
+      expect(harness.controls.calls.release).toBe(3);
+      expect(await harness.marker(wamid)).toBeNull();
+      expect((await harness.post(null, { raw })).status).toBe(200);
+      expect(sentCount()).toBe(before + 1);
+    });
+  });
+
+  describe("when the process dies after claiming the marker", () => {
+    const crash = (wamid: string) => claimWhatsappMessage(harness.server.db, { wamid, businessId: tenant.businessId });
+
+    it("treats the retry inside the lease as a duplicate and processes it once after the lease", async () => {
+      reset();
+      const wamid = newWamid();
+      const phone = "573002220010";
+      const raw = confirm(wamid, phone, "2031-03-11T14:00:00.000Z");
+      expect(await crash(wamid)).toBe(true);
+      const before = harness.client.messagesTo(phone).length;
+
+      expect((await harness.post(null, { raw })).status).toBe(200);
+      expect(harness.client.messagesTo(phone)).toHaveLength(before);
+      expect((await tenant.appointments()).filter((row) => row.customerPhone === phone)).toHaveLength(0);
+
+      harness.controls.leaseMs = 0;
+      expect((await harness.post(null, { raw })).status).toBe(200);
+      expect((await harness.post(null, { raw })).status).toBe(200);
+
+      expect((await tenant.appointments()).filter((row) => row.customerPhone === phone)).toHaveLength(1);
+      expect(harness.client.messagesTo(phone)).toHaveLength(before + 1);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+    });
+
+    it("lets exactly one of 20 concurrent deliveries take the marker over: one booking, one reply", async () => {
+      reset();
+      const wamid = newWamid();
+      const phone = "573002220011";
+      const raw = confirm(wamid, phone, "2031-03-13T14:00:00.000Z");
+      harness.controls.leaseMs = 150;
+      expect(await crash(wamid)).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const handledBefore = harness.logs.filter((line) => line.includes("message handled")).length;
+
+      const responses = await Promise.all(Array.from({ length: 20 }, () => harness.post(null, { raw })));
+
+      expect(responses.map((res) => res.status)).toEqual(Array(20).fill(200));
+      expect((await tenant.appointments()).filter((row) => row.customerPhone === phone)).toHaveLength(1);
+      expect(harness.client.messagesTo(phone)).toHaveLength(1);
+      expect(harness.logs.filter((line) => line.includes("message handled")).length - handledBefore).toBe(1);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+    });
+
+    it("never takes over a completed marker, however short the lease", async () => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      expect((await harness.post(null, { raw })).status).toBe(200);
+      harness.controls.leaseMs = 0;
+
+      const repeats = await Promise.all(Array.from({ length: 5 }, () => harness.post(null, { raw })));
+
+      expect(repeats.map((res) => res.status)).toEqual(Array(5).fill(200));
+      expect(sentCount()).toBe(before + 1);
+    });
+  });
+
+  describe("when the reply fails after the agenda was changed", () => {
+    it("completes the marker and does not run the bot step again, even after the lease", async () => {
+      reset();
+      const wamid = newWamid();
+      const phone = "573002220020";
+      const raw = confirm(wamid, phone, "2031-03-14T14:00:00.000Z");
+      harness.client.failures = 1;
+      harness.controls.calls.release = 0;
+
+      const failed = await harness.post(null, { raw });
+      harness.controls.leaseMs = 0;
+      const retried = await harness.post(null, { raw });
+
+      expect([failed.status, retried.status]).toEqual([200, 200]);
+      expect(harness.controls.calls.release).toBe(0);
+      expect((await tenant.appointments()).filter((row) => row.customerPhone === phone)).toHaveLength(1);
+      expect(harness.client.messagesTo(phone)).toHaveLength(0);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+    });
+
+    it("also completes it when the failure is permanent", async () => {
+      reset();
+      const wamid = newWamid();
+      const phone = "573002220021";
+      const raw = confirm(wamid, phone, "2031-03-14T14:30:00.000Z");
+      harness.client.errors = [new WhatsAppSendError(401, 190)];
+
+      const failed = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(200);
+      expect((await tenant.appointments()).filter((row) => row.customerPhone === phone)).toHaveLength(1);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+    });
+  });
+
+  describe("when completing the marker fails after a successful reply", () => {
+    it("still answers 200 and leaves the marker uncompleted for the lease instead of releasing it", async () => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      harness.controls.fail.complete = Number.POSITIVE_INFINITY;
+      harness.controls.calls.release = 0;
+
+      const res = await harness.post(null, { raw });
+
+      expect(res.status).toBe(200);
+      expect(sentCount()).toBe(before + 1);
+      expect(harness.controls.calls.release).toBe(0);
+      expect(await harness.marker(wamid)).toMatchObject({ completedAt: null });
+      expect(harness.logs.some((line) => line.startsWith("error") && line.includes("could not complete the message marker"))).toBe(true);
+    });
+  });
+
+  describe("permanent and transient send failures", () => {
+    it.each([
+      [400, 100],
+      [401, 190],
+      [403, 10],
+      [404, 100],
+    ])("answers 200, completes the marker and does not loop on HTTP %i", async (status, graphCode) => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      harness.client.errors = [new WhatsAppSendError(status, graphCode)];
+      harness.controls.calls.release = 0;
+
+      const failed = await harness.post(null, { raw });
+      harness.controls.leaseMs = 0;
+      const second = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(sentCount()).toBe(before);
+      expect(harness.controls.calls.release).toBe(0);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+      const line = harness.logs.findLast((entry) => entry.startsWith("error") && entry.includes(`status ${status}`));
+      expect(line).toBeDefined();
+      expect(line).toContain("will not be retried");
+      for (const secret of [APP_SECRET, VERIFY_TOKEN, ACCESS_TOKEN, "573002220001"]) expect(line).not.toContain(secret);
+    });
+
+    it.each<[string, Error]>([
+      ["HTTP 500", new WhatsAppSendError(500)],
+      ["HTTP 502", new WhatsAppSendError(502)],
+      ["HTTP 408", new WhatsAppSendError(408)],
+      ["HTTP 429", new WhatsAppSendError(429, 130429)],
+      ["a network error", new TypeError("fetch failed")],
+      ["a timeout", new DOMException("The operation was aborted due to timeout", "TimeoutError")],
+      ["an unknown error", new Error("boom")],
+    ])("answers 503 and releases the marker on %s, so Meta's retry is processed", async (_name, error) => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      harness.client.errors = [error];
+
+      const failed = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(503);
+      expect(await harness.marker(wamid)).toBeNull();
+      expect((await harness.post(null, { raw })).status).toBe(200);
+      expect(sentCount()).toBe(before + 1);
+      expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
+    });
+  });
+
+  describe("when the store itself fails", () => {
+    it("answers 503 when the channel lookup throws and processes the retry", async () => {
+      reset();
+      const wamid = newWamid();
+      const raw = JSON.stringify(textPayload(options(wamid), "hola"));
+      const before = sentCount();
+      harness.controls.fail.findChannel = 1;
+
+      const failed = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(503);
+      expect(sentCount()).toBe(before);
+      expect(await harness.marker(wamid)).toBeNull();
+      expect((await harness.post(null, { raw })).status).toBe(200);
+      expect(sentCount()).toBe(before + 1);
+    });
+
+    it("answers 503 when a claim throws, and a retry deduplicates the messages that were already handled", async () => {
+      reset();
+      const [first, second] = [newWamid(), newWamid()];
+      const [phoneA, phoneB] = ["573002220030", "573002220031"];
+      const message = (id: string, from: string) => ({ from, id, type: "text", text: { body: "hola" } });
+      const raw = JSON.stringify({
+        object: "whatsapp_business_account",
+        entry: [{ changes: [{ field: "messages", value: { metadata: { phone_number_id: tenant.phoneNumberId }, messages: [message(first, phoneA), message(second, phoneB)] } }] }],
+      });
+      harness.controls.fail.claimWamids.add(second);
+
+      const failed = await harness.post(null, { raw });
+
+      expect(failed.status).toBe(503);
+      expect(harness.client.messagesTo(phoneA)).toHaveLength(1);
+      expect(harness.client.messagesTo(phoneB)).toHaveLength(0);
+      expect(await harness.marker(second)).toBeNull();
+
+      harness.controls.fail.claimWamids.clear();
+      harness.controls.leaseMs = 0;
+      const retried = await harness.post(null, { raw });
+
+      expect(retried.status).toBe(200);
+      expect(harness.client.messagesTo(phoneA)).toHaveLength(1);
+      expect(harness.client.messagesTo(phoneB)).toHaveLength(1);
+      expect((await harness.marker(first))?.completedAt).toBeInstanceOf(Date);
+      expect((await harness.marker(second))?.completedAt).toBeInstanceOf(Date);
+    });
   });
 });

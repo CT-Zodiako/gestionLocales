@@ -1,9 +1,9 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import type { claimWhatsappMessage, findWhatsappChannel, releaseWhatsappMessage } from "@gestion/db";
+import type { claimWhatsappMessage, completeWhatsappMessage, findWhatsappChannel, releaseWhatsappMessage } from "@gestion/db";
 import { extractIncomingBatches, type ErrorResponse, type IncomingBatch, type IncomingMessage } from "@gestion/shared";
 import { handleIncoming, type BotStore, type EffectTracker } from "./bot.ts";
-import type { WhatsAppClient } from "./client.ts";
+import { isPermanentSendError, type WhatsAppClient } from "./client.ts";
 import { consoleLogger, describeError, maskPhone, type WhatsAppLogger } from "./logger.ts";
 import { safeEqual, verifySignature } from "./signature.ts";
 
@@ -15,6 +15,7 @@ export interface WhatsAppStore extends BotStore {
   findChannel: Bound<typeof findWhatsappChannel>;
   claimMessage: Bound<typeof claimWhatsappMessage>;
   releaseMessage: Bound<typeof releaseWhatsappMessage>;
+  completeMessage: Bound<typeof completeWhatsappMessage>;
 }
 
 export interface WhatsAppWebhookDeps {
@@ -43,13 +44,39 @@ const tooLarge = { error: "payload_too_large" } satisfies ErrorResponse;
 
 type Outcome = "done" | "retry";
 
+/** Extra attempts for a marker release or completion that failed, and the pause before each one. */
+const MARKER_RETRIES = 2;
+const MARKER_RETRY_DELAY_MS = 50;
+
+/** Runs a marker operation, retrying it a couple of times; returns whether it finally succeeded. Never throws. */
+async function attemptMarkerOperation(operation: () => Promise<void>, onFailure: (error: unknown) => void): Promise<boolean> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await operation();
+      return true;
+    } catch (error) {
+      if (attempt >= MARKER_RETRIES) {
+        onFailure(error);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, MARKER_RETRY_DELAY_MS));
+    }
+  }
+}
+
 /**
- * Handles one message exactly once. The `wamid` marker is stored first (atomic insert, so duplicates and
- * concurrent deliveries stop here). If handling or sending then fails:
- *   - nothing had been changed: the marker is removed and the delivery is answered 5xx, so Meta's retry
- *     reprocesses the message;
- *   - the agenda had already been changed (a booking or cancellation): the marker stays, so a retry can
- *     never apply it twice; the confirmation is lost, but "Mis citas" shows the result.
+ * Handles one message exactly once. The `wamid` marker is claimed first (atomic upsert, so duplicates and
+ * concurrent deliveries stop here). The marker is a lease: until it is completed, a retry that arrives after
+ * the lease (2 minutes) may take it over, so a crash or a failed release can never lose the message for good.
+ * How handling ends:
+ *   - success: the marker is completed;
+ *   - failed, but the agenda had already been changed (a booking or cancellation): the marker is completed, so
+ *     a retry can never apply it twice; the confirmation is lost, but "Mis citas" shows the result;
+ *   - failed before any side effect with a permanent send error (Graph 4xx other than 408/429, for example a
+ *     revoked token): retrying cannot help, so the marker is completed, the error is logged and Meta gets 200;
+ *   - failed before any side effect with a transient error: the marker is removed (a failed release is retried
+ *     twice; if it still fails the marker stays uncompleted and the lease lets Meta's retry take over later) and
+ *     the delivery is answered 5xx so Meta redelivers.
  */
 async function processMessage(
   deps: Required<Pick<WhatsAppWebhookDeps, "client" | "store">> & { logger: WhatsAppLogger; now: () => Date },
@@ -62,6 +89,16 @@ async function processMessage(
     logger.info("duplicate message ignored", { wamid: message.wamid });
     return "done";
   }
+
+  const complete = () =>
+    attemptMarkerOperation(
+      () => store.completeMessage(message.wamid),
+      (error) =>
+        logger.error("could not complete the message marker; a retry after the lease will handle it again", {
+          wamid: message.wamid,
+          reason: describeError(error),
+        }),
+    );
 
   const effects: EffectTracker = { applied: false };
   try {
@@ -78,21 +115,35 @@ async function processMessage(
       message.content,
     );
     await client.sendMessage({ phoneNumberId: channel.phoneNumberId, message: reply });
-    logger.info("message handled", { wamid: message.wamid, from: maskPhone(message.from) });
-    return "done";
   } catch (error) {
     const fields = { wamid: message.wamid, from: maskPhone(message.from), reason: describeError(error) };
     if (effects.applied) {
       logger.error("reply failed after a side effect; the message stays marked so it is not applied twice", fields);
+      await complete();
+      return "done";
+    }
+
+    if (isPermanentSendError(error)) {
+      logger.error("message failed before any side effect with a permanent send error; it will not be retried", fields);
+      await complete();
       return "done";
     }
 
     logger.error("message failed before any side effect; asking Meta to retry", fields);
-    await store.releaseMessage(message.wamid).catch((releaseError: unknown) => {
-      logger.error("could not remove the message marker", { wamid: message.wamid, reason: describeError(releaseError) });
-    });
+    await attemptMarkerOperation(
+      () => store.releaseMessage(message.wamid),
+      (releaseError) =>
+        logger.error("could not remove the message marker; the lease lets a later retry take it over", {
+          wamid: message.wamid,
+          reason: describeError(releaseError),
+        }),
+    );
     return "retry";
   }
+
+  await complete();
+  logger.info("message handled", { wamid: message.wamid, from: maskPhone(message.from) });
+  return "done";
 }
 
 async function processBatch(

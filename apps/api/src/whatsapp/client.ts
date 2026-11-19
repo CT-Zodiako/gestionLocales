@@ -20,6 +20,18 @@ export class WhatsAppSendError extends Error {
   }
 }
 
+/**
+ * True when resending the same message cannot succeed: the Graph API answered with a 4xx other than
+ * 408 (request timeout) and 429 (rate limit), such as an invalid or expired token (401/403), a rejected
+ * message body (400) or an unknown phone number id (404). Network errors, timeouts, 5xx, 408, 429 and
+ * anything that is not a `WhatsAppSendError` are transient.
+ */
+export function isPermanentSendError(error: unknown): boolean {
+  if (!(error instanceof WhatsAppSendError)) return false;
+  const { status } = error;
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
 export interface FetchClientOptions {
   /** WHATSAPP_TOKEN: sent as a Bearer token, never logged. */
   token: string;
