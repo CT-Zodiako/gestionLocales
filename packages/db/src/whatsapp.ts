@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { AppointmentDetail } from "./agenda.ts";
 import type { Database } from "./client.ts";
 import {
@@ -63,23 +63,70 @@ export interface ClaimWhatsappMessageInput {
   businessId: string;
 }
 
+/** How long an uncompleted marker protects a message before a retry may take it over. */
+export const WHATSAPP_MESSAGE_LEASE_MS = 120_000;
+
+export interface ClaimWhatsappMessageOptions {
+  /** Lease duration in milliseconds; `WHATSAPP_MESSAGE_LEASE_MS` by default. Tests shorten it. */
+  leaseMs?: number;
+}
+
 /**
- * Marks a message as being handled. Returns true for the one caller that stored the marker and false
- * for every duplicate (a retry, or a concurrent delivery of the same message): one atomic
- * `INSERT ... ON CONFLICT DO NOTHING` on the primary key.
+ * Marks a message as being handled. Returns true for the one caller that now owns it and false for every
+ * other (a duplicate of a finished message, or a delivery while another one is still in flight): one atomic
+ * `INSERT ... ON CONFLICT (wamid) DO UPDATE ... WHERE`.
+ *
+ * The marker is a lease. When no row exists it is inserted. When one exists it is taken over (`received_at`
+ * moves to now, in the same statement) only if it is NOT completed and older than the lease: that is a handler
+ * that died or never managed to release it, and Meta's retry must not be treated as a duplicate forever.
+ * Concurrent takeovers serialize on the row lock and only the first one still sees an expired lease.
  */
-export async function claimWhatsappMessage(db: Database, input: ClaimWhatsappMessageInput): Promise<boolean> {
+export async function claimWhatsappMessage(
+  db: Database,
+  input: ClaimWhatsappMessageInput,
+  options: ClaimWhatsappMessageOptions = {},
+): Promise<boolean> {
+  const leaseMs = options.leaseMs ?? WHATSAPP_MESSAGE_LEASE_MS;
   const rows = await db
     .insert(whatsappProcessedMessages)
     .values(input)
-    .onConflictDoNothing({ target: whatsappProcessedMessages.wamid })
+    .onConflictDoUpdate({
+      target: whatsappProcessedMessages.wamid,
+      set: { receivedAt: sql`now()` },
+      setWhere: sql`${whatsappProcessedMessages.completedAt} is null and ${whatsappProcessedMessages.receivedAt} < now() - ${leaseMs}::double precision * interval '1 millisecond'`,
+    })
     .returning({ wamid: whatsappProcessedMessages.wamid });
   return rows.length > 0;
+}
+
+/** Marks handling as finished without needing a retry, so the lease can never take the marker over. */
+export async function completeWhatsappMessage(db: Database, wamid: string): Promise<void> {
+  await db
+    .update(whatsappProcessedMessages)
+    .set({ completedAt: sql`now()` })
+    .where(and(eq(whatsappProcessedMessages.wamid, wamid), isNull(whatsappProcessedMessages.completedAt)));
 }
 
 /** Removes the marker so a later delivery of the same message is handled again (only when nothing was changed). */
 export async function releaseWhatsappMessage(db: Database, wamid: string): Promise<void> {
   await db.delete(whatsappProcessedMessages).where(eq(whatsappProcessedMessages.wamid, wamid));
+}
+
+/** The stored marker of a message id, or null: lets callers and tests tell "in flight" from "completed". */
+export async function getWhatsappMessageMarker(
+  db: Database,
+  wamid: string,
+): Promise<{ businessId: string; receivedAt: Date; completedAt: Date | null } | null> {
+  const rows = await db
+    .select({
+      businessId: whatsappProcessedMessages.businessId,
+      receivedAt: whatsappProcessedMessages.receivedAt,
+      completedAt: whatsappProcessedMessages.completedAt,
+    })
+    .from(whatsappProcessedMessages)
+    .where(eq(whatsappProcessedMessages.wamid, wamid))
+    .limit(1);
+  return rows[0] ?? null;
 }
 
 export interface PhoneAppointmentsInput {

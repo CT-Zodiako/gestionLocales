@@ -29,6 +29,13 @@
       "when": 1795101026900,
       "tag": "0003_whatsapp",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795110527804,
+      "tag": "0004_whatsapp_message_lease",
+      "breakpoints": true
     }
   ]
 }

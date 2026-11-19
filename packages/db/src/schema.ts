@@ -215,7 +215,9 @@ export const whatsappChannels = pgTable(
 
 /**
  * Idempotency markers: one row per WhatsApp message id (`wamid`) the webhook has started handling.
- * The primary key plus `ON CONFLICT DO NOTHING` makes a retried or concurrently duplicated delivery a no-op.
+ * The primary key makes a retried or concurrently duplicated delivery a no-op. `completed_at` is set once
+ * handling ended without needing a retry; a marker that never completes (a crash) is a lease: after
+ * `received_at` + lease a retry may take it over (`claimWhatsappMessage`).
  */
 export const whatsappProcessedMessages = pgTable(
   "whatsapp_processed_messages",
@@ -225,6 +227,7 @@ export const whatsappProcessedMessages = pgTable(
       .notNull()
       .references(() => businesses.id),
     receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
   },
   (table) => [index("whatsapp_processed_messages_business_id_idx").on(table.businessId)],
 );
