@@ -15,6 +15,7 @@
     "db:generate": "pnpm --filter @gestion/db generate",
     "db:migrate": "pnpm --filter @gestion/db migrate",
     "auth:create-user": "pnpm --filter @gestion/api auth:create-user",
+    "whatsapp:link": "pnpm --filter @gestion/api whatsapp:link",
     "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "devDependencies": {

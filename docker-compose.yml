@@ -25,6 +25,15 @@ services:
       # Dev-only defaults: replace both for any shared or public deployment.
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-better-auth-secret-change-me-0123456789}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:8080}
+      # WhatsApp bot: empty means disabled (the webhook answers 404). Never put real values in this file:
+      # export them in the shell or an untracked .env when starting the stack. Set all three of
+      # WHATSAPP_APP_SECRET, WHATSAPP_VERIFY_TOKEN and WHATSAPP_TOKEN, or none (see the README).
+      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-}
+      WHATSAPP_TOKEN: ${WHATSAPP_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-}
+      WHATSAPP_API_BASE_URL: ${WHATSAPP_API_BASE_URL:-}
     depends_on:
       postgres:
         condition: service_healthy

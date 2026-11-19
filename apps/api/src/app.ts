@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { createMiddleware } from "hono/factory";
 import type { ErrorResponse, HealthResponse, MeResponse } from "@gestion/shared";
 import { createAgendaRoutes, type AgendaDeps } from "./agenda-routes.ts";
+import { createWhatsAppRoutes, type WhatsAppWebhookDeps } from "./whatsapp/webhook-routes.ts";
 
 /** What the API needs from the auth instance; kept narrow so tests can stub it. */
 export type AuthDeps = {
@@ -19,6 +20,8 @@ export type AppDeps = {
   findUserWithBusiness: (userId: string) => Promise<MeResponse | null>;
   /** Agenda data access; the agenda routes (appointments, services, opening hours) exist only when given. */
   agenda?: AgendaDeps;
+  /** The WhatsApp webhook; when absent its routes answer 404. It is deliberately not behind the session guard. */
+  whatsapp?: WhatsAppWebhookDeps;
 };
 
 export type SessionEnv = { Variables: { userId: string } };
@@ -69,6 +72,14 @@ export function createApp(deps: AppDeps) {
     app.route("/appointments", agenda.appointments);
     app.route("/services", agenda.services);
     app.route("/opening-hours", agenda.openingHours);
+  }
+
+  // Meta calls the webhook without a session: it authenticates itself (verify token, HMAC signature), and
+  // `requireSession` is only attached to the routers above, never globally.
+  if (deps.whatsapp) {
+    app.route("/whatsapp", createWhatsAppRoutes(deps.whatsapp));
+  } else {
+    app.all("/whatsapp/*", (c) => c.json({ error: "not_found" } satisfies ErrorResponse, 404));
   }
 
   return app;
