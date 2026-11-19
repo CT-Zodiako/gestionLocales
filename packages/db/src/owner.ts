@@ -1,6 +1,7 @@
 import { and, eq, notExists } from "drizzle-orm";
 import type { Database } from "./client.ts";
 import {
+  appointmentReminders,
   appointments,
   businesses,
   customers,
@@ -61,6 +62,12 @@ export async function removeBusinessIfUnreferenced(db: Database, businessId: str
       notExists(db.select({ id: services.id }).from(services).where(eq(services.businessId, businessId))),
       notExists(db.select({ id: openingHours.id }).from(openingHours).where(eq(openingHours.businessId, businessId))),
       notExists(db.select({ id: appointments.id }).from(appointments).where(eq(appointments.businessId, businessId))),
+      notExists(
+        db
+          .select({ id: appointmentReminders.id })
+          .from(appointmentReminders)
+          .where(eq(appointmentReminders.businessId, businessId)),
+      ),
       notExists(db.select({ id: whatsappChannels.id }).from(whatsappChannels).where(eq(whatsappChannels.businessId, businessId))),
       notExists(
         db

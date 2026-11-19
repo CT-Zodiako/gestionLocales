@@ -191,6 +191,8 @@ export const appointments = pgTable(
     index("appointments_business_starts_at_idx").on(table.businessId, table.startsAt),
     index("appointments_customer_id_idx").on(table.customerId),
     index("appointments_service_id_idx").on(table.serviceId),
+    // Target of the composite foreign key from appointment_reminders (a reminder can only point at an appointment of its own business).
+    unique("appointments_id_business_id_unique").on(table.id, table.businessId),
     check("appointments_ends_after_starts", sql`${table.endsAt} > ${table.startsAt}`),
     check("appointments_status_valid", sql`${table.status} in ('booked', 'cancelled')`),
   ],
@@ -232,6 +234,70 @@ export const whatsappProcessedMessages = pgTable(
   (table) => [index("whatsapp_processed_messages_business_id_idx").on(table.businessId)],
 );
 
+export const REMINDER_KIND = {
+  /** Sent right after the appointment is created. */
+  CONFIRMATION: "confirmation",
+  /** Sent 24 hours before the appointment starts. */
+  REMINDER_24H: "reminder_24h",
+} as const;
+
+export type ReminderKind = (typeof REMINDER_KIND)[keyof typeof REMINDER_KIND];
+
+export const REMINDER_STATUS = {
+  PENDING: "pending",
+  /** Claimed by a sweep: the lease (`claimed_at`) protects it from other sweeps until it expires. */
+  SENDING: "sending",
+  SENT: "sent",
+  FAILED: "failed",
+  SKIPPED: "skipped",
+} as const;
+
+export type ReminderStatus = (typeof REMINDER_STATUS)[keyof typeof REMINDER_STATUS];
+
+/**
+ * Source of truth for WhatsApp reminders: one row per appointment and kind, created in the same transaction as
+ * the appointment. The sweep claims due `pending` rows (`sending` + `claimed_at` lease) before it calls WhatsApp.
+ * `last_error` only ever holds a short, credential-free and phone-free description.
+ */
+export const appointmentReminders = pgTable(
+  "appointment_reminders",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    businessId: uuid("business_id")
+      .notNull()
+      .references(() => businesses.id),
+    appointmentId: uuid("appointment_id").notNull(),
+    kind: text("kind").$type<ReminderKind>().notNull(),
+    dueAt: timestamp("due_at", { withTimezone: true }).notNull(),
+    status: text("status").$type<ReminderStatus>().notNull().default(REMINDER_STATUS.PENDING),
+    /** Send attempts started (each claim counts one, including a retaken stale claim). */
+    attempts: integer("attempts").notNull().default(0),
+    /** When the current claim started; the lease runs from here. Null unless `sending`. */
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    whatsappMessageId: text("whatsapp_message_id"),
+    lastError: text("last_error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    // The appointment must belong to the same business as the reminder.
+    foreignKey({
+      name: "appointment_reminders_appointment_business_fk",
+      columns: [table.appointmentId, table.businessId],
+      foreignColumns: [appointments.id, appointments.businessId],
+    }),
+    unique("appointment_reminders_appointment_kind_unique").on(table.appointmentId, table.kind),
+    index("appointment_reminders_status_due_at_idx").on(table.status, table.dueAt),
+    index("appointment_reminders_business_id_idx").on(table.businessId),
+    check("appointment_reminders_kind_valid", sql`${table.kind} in ('confirmation', 'reminder_24h')`),
+    check(
+      "appointment_reminders_status_valid",
+      sql`${table.status} in ('pending', 'sending', 'sent', 'failed', 'skipped')`,
+    ),
+    check("appointment_reminders_attempts_non_negative", sql`${table.attempts} >= 0`),
+  ],
+);
+
 export type User = typeof users.$inferSelect;
 export type Business = typeof businesses.$inferSelect;
 export type Customer = typeof customers.$inferSelect;
@@ -239,3 +305,4 @@ export type Service = typeof services.$inferSelect;
 export type OpeningHour = typeof openingHours.$inferSelect;
 export type Appointment = typeof appointments.$inferSelect;
 export type WhatsappChannel = typeof whatsappChannels.$inferSelect;
+export type AppointmentReminder = typeof appointmentReminders.$inferSelect;

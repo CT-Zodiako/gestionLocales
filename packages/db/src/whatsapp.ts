@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { AppointmentDetail } from "./agenda.ts";
 import type { Database } from "./client.ts";
+import { skipPendingReminders } from "./reminders.ts";
 import {
   APPOINTMENT_STATUS,
   appointments,
@@ -222,8 +223,8 @@ export async function findUpcomingAppointmentForPhone(
 
 /**
  * Cancels a booked, upcoming appointment, only when it belongs to that phone within that business. One
- * atomic UPDATE, so ownership is enforced at the moment of the write; returns null when there is nothing
- * to cancel (unknown, someone else's, past or already cancelled).
+ * atomic UPDATE, so ownership is enforced at the moment of the write (its pending reminders are skipped in the
+ * same transaction); returns null when there is nothing to cancel (unknown, someone else's, past or already cancelled).
  */
 export async function cancelUpcomingAppointmentForPhone(
   db: Database,
@@ -233,18 +234,23 @@ export async function cancelUpcomingAppointmentForPhone(
     .select({ id: customers.id })
     .from(customers)
     .where(and(eq(customers.businessId, input.businessId), eq(customers.phone, input.phone)));
-  const rows = await db
-    .update(appointments)
-    .set({ status: APPOINTMENT_STATUS.CANCELLED })
-    .where(
-      and(
-        eq(appointments.id, input.appointmentId),
-        eq(appointments.businessId, input.businessId),
-        eq(appointments.status, APPOINTMENT_STATUS.BOOKED),
-        gt(appointments.startsAt, input.from),
-        inArray(appointments.customerId, owned),
-      ),
-    )
-    .returning();
-  return rows[0] ?? null;
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .update(appointments)
+      .set({ status: APPOINTMENT_STATUS.CANCELLED })
+      .where(
+        and(
+          eq(appointments.id, input.appointmentId),
+          eq(appointments.businessId, input.businessId),
+          eq(appointments.status, APPOINTMENT_STATUS.BOOKED),
+          gt(appointments.startsAt, input.from),
+          inArray(appointments.customerId, owned),
+        ),
+      )
+      .returning();
+    const cancelled = rows[0];
+    if (!cancelled) return null;
+    await skipPendingReminders(tx, cancelled);
+    return cancelled;
+  });
 }
