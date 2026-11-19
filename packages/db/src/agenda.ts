@@ -7,6 +7,8 @@ import {
   customers,
   openingHours,
   services,
+  whatsappChannels,
+  whatsappProcessedMessages,
   type Appointment,
   type Customer,
   type OpeningHour,
@@ -292,9 +294,18 @@ export async function listAppointmentDetails(
     .orderBy(asc(appointments.startsAt));
 }
 
+/** Sets the IANA timezone the business's opening hours and appointments are read in; throws on an unknown zone. */
+export async function setBusinessTimezone(db: Database, businessId: string, timezone: string): Promise<void> {
+  // Intl rejects names that are not IANA zones (RangeError), so a bad value never reaches the database.
+  new Intl.DateTimeFormat("en", { timeZone: timezone });
+  await db.update(businesses).set({ timezone }).where(eq(businesses.id, businessId));
+}
+
 /** Deletes a business together with all its agenda data (appointments first); for cleanup and tests. */
 export async function removeBusinessWithAgenda(db: Database, businessId: string): Promise<void> {
   await db.transaction(async (tx) => {
+    await tx.delete(whatsappProcessedMessages).where(eq(whatsappProcessedMessages.businessId, businessId));
+    await tx.delete(whatsappChannels).where(eq(whatsappChannels.businessId, businessId));
     await tx.delete(appointments).where(eq(appointments.businessId, businessId));
     await tx.delete(openingHours).where(eq(openingHours.businessId, businessId));
     await tx.delete(services).where(eq(services.businessId, businessId));

@@ -196,9 +196,43 @@ export const appointments = pgTable(
   ],
 );
 
+/**
+ * Maps a WhatsApp Business phone number (Meta's `phone_number_id`) to the business that owns it, so an
+ * incoming webhook message is routed to the right business. One phone number belongs to one business.
+ */
+export const whatsappChannels = pgTable(
+  "whatsapp_channels",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    businessId: uuid("business_id")
+      .notNull()
+      .references(() => businesses.id),
+    phoneNumberId: text("phone_number_id").notNull().unique(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("whatsapp_channels_business_id_idx").on(table.businessId)],
+);
+
+/**
+ * Idempotency markers: one row per WhatsApp message id (`wamid`) the webhook has started handling.
+ * The primary key plus `ON CONFLICT DO NOTHING` makes a retried or concurrently duplicated delivery a no-op.
+ */
+export const whatsappProcessedMessages = pgTable(
+  "whatsapp_processed_messages",
+  {
+    wamid: text("wamid").primaryKey(),
+    businessId: uuid("business_id")
+      .notNull()
+      .references(() => businesses.id),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("whatsapp_processed_messages_business_id_idx").on(table.businessId)],
+);
+
 export type User = typeof users.$inferSelect;
 export type Business = typeof businesses.$inferSelect;
 export type Customer = typeof customers.$inferSelect;
 export type Service = typeof services.$inferSelect;
 export type OpeningHour = typeof openingHours.$inferSelect;
 export type Appointment = typeof appointments.$inferSelect;
+export type WhatsappChannel = typeof whatsappChannels.$inferSelect;
