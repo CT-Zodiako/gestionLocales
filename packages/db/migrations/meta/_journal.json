@@ -22,6 +22,13 @@
       "when": 1795026289517,
       "tag": "0002_data_model",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795101026900,
+      "tag": "0003_whatsapp",
+      "breakpoints": true
     }
   ]
 }
