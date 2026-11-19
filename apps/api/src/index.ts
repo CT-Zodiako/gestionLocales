@@ -3,6 +3,7 @@ import { runMigrations } from "@gestion/db";
 import { readApiEnv, type ApiEnv } from "./env.ts";
 import { createServer } from "./server.ts";
 import { createFetchWhatsAppClient } from "./whatsapp/client.ts";
+import { describeError } from "./whatsapp/logger.ts";
 
 let env: ApiEnv;
 try {
@@ -32,10 +33,25 @@ const server = createServer({
             baseUrl: env.whatsapp.apiBaseUrl,
           }),
         },
+        ...(env.reminders ? { reminders: { templates: env.reminders.templates } } : {}),
       }
     : {}),
 });
 console.log(env.whatsapp ? "WhatsApp webhook enabled at /api/whatsapp/webhook" : "WhatsApp webhook disabled (WHATSAPP_* not set)");
+
+if (server.reminders) {
+  try {
+    await server.reminders.start();
+    console.log("Reminders enabled: pg-boss sweeps due reminders every minute");
+  } catch (error) {
+    // A reminders worker that silently does not run is worse than a refused start.
+    console.error(`Reminders worker could not start: ${describeError(error)}`);
+    await server.close();
+    process.exit(1);
+  }
+} else {
+  console.log("Reminders disabled (set WHATSAPP_TEMPLATE_CONFIRMATION and WHATSAPP_TEMPLATE_REMINDER, with WhatsApp enabled)");
+}
 
 const httpServer = serve({ fetch: server.app.fetch, port: env.port }, (info) => {
   console.log(`API listening on http://localhost:${info.port}`);

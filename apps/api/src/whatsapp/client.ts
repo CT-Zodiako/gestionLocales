@@ -1,4 +1,4 @@
-import type { OutgoingMessage } from "./messages.ts";
+import type { OutgoingMessage, TemplateMessage } from "./messages.ts";
 
 /** Graph API host; `WHATSAPP_API_BASE_URL` overrides it (a local stub in smoke tests). */
 export const DEFAULT_GRAPH_BASE_URL = "https://graph.facebook.com";
@@ -7,6 +7,11 @@ export const DEFAULT_GRAPH_BASE_URL = "https://graph.facebook.com";
 export interface WhatsAppClient {
   /** Sends `message` from the business number `phoneNumberId`; rejects when WhatsApp does not accept it. */
   sendMessage: (input: { phoneNumberId: string; message: OutgoingMessage }) => Promise<void>;
+  /**
+   * Sends a template message (reminders) and resolves with the WhatsApp message id Graph assigned, or null when
+   * its answer did not carry one. Rejects like `sendMessage`.
+   */
+  sendTemplate: (input: { phoneNumberId: string; message: TemplateMessage }) => Promise<{ messageId: string | null }>;
 }
 
 /** The Graph API refused a message, or could not be reached. Its message never holds the token or the recipient. */
@@ -53,28 +58,43 @@ function graphErrorCode(body: unknown): number | undefined {
   return typeof error.code === "number" ? error.code : undefined;
 }
 
+function graphMessageId(body: unknown): string | null {
+  if (typeof body !== "object" || body === null || !("messages" in body) || !Array.isArray(body.messages)) return null;
+  const [first] = body.messages;
+  if (typeof first !== "object" || first === null || !("id" in first)) return null;
+  return typeof first.id === "string" && first.id !== "" ? first.id : null;
+}
+
 /** The real client: `POST {base}/{version}/{phone_number_id}/messages` with a Bearer token. */
 export function createFetchWhatsAppClient(options: FetchClientOptions): WhatsAppClient {
   const fetchImpl = options.fetch ?? fetch;
   const baseUrl = (options.baseUrl ?? DEFAULT_GRAPH_BASE_URL).replace(/\/+$/, "");
 
+  /** Posts one message and returns the successful response; throws `WhatsAppSendError` otherwise. */
+  async function post(phoneNumberId: string, message: OutgoingMessage | TemplateMessage): Promise<Response> {
+    if (!/^\d{1,32}$/.test(phoneNumberId)) throw new Error("Invalid phone number id");
+
+    const response = await fetchImpl(`${baseUrl}/${options.apiVersion}/${phoneNumberId}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${options.token}`, "content-type": "application/json" },
+      body: JSON.stringify(message),
+      signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+    });
+    if (response.ok) return response;
+
+    const body: unknown = await response.json().catch(() => undefined);
+    throw new WhatsAppSendError(response.status, graphErrorCode(body));
+  }
+
   return {
     async sendMessage({ phoneNumberId, message }) {
-      if (!/^\d{1,32}$/.test(phoneNumberId)) throw new Error("Invalid phone number id");
-
-      const response = await fetchImpl(`${baseUrl}/${options.apiVersion}/${phoneNumberId}/messages`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${options.token}`, "content-type": "application/json" },
-        body: JSON.stringify(message),
-        signal: AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
-      });
-      if (response.ok) {
-        await response.body?.cancel();
-        return;
-      }
-
+      const response = await post(phoneNumberId, message);
+      await response.body?.cancel();
+    },
+    async sendTemplate({ phoneNumberId, message }) {
+      const response = await post(phoneNumberId, message);
       const body: unknown = await response.json().catch(() => undefined);
-      throw new WhatsAppSendError(response.status, graphErrorCode(body));
+      return { messageId: graphMessageId(body) };
     },
   };
 }

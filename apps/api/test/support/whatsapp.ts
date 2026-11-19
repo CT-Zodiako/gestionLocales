@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { expect } from "vitest";
-import type { OutgoingMessage } from "../../src/whatsapp/messages.ts";
+import type { OutgoingMessage, TemplateMessage } from "../../src/whatsapp/messages.ts";
 import type { WhatsAppClient } from "../../src/whatsapp/client.ts";
 
 /** Throwaway constants: tests never use or read real credentials. */
@@ -76,14 +76,96 @@ export function assertWithinLimits(message: OutgoingMessage): void {
   expect(new Set(rows.map((row) => row.id)).size).toBe(rows.length);
 }
 
+/** Fails the test when a template message is not what the Graph API accepts for these templates. */
+export function assertTemplateShape(message: TemplateMessage): void {
+  expect(message.messaging_product).toBe("whatsapp");
+  expect(message.type).toBe("template");
+  expect(message.to).toMatch(/^\d{8,15}$/);
+  expect(message.template.name).toMatch(/^[a-z0-9_]+$/);
+  expect(message.template.language.code).toMatch(/^[a-z]{2,3}(_[A-Z]{2})?$/);
+  expect(message.template.components).toHaveLength(1);
+  const body = message.template.components[0];
+  expect(body?.type).toBe("body");
+  expect(body?.parameters).toHaveLength(4);
+  for (const parameter of body?.parameters ?? []) {
+    expect(parameter.type).toBe("text");
+    // Meta refuses empty parameters and line breaks, tabs or runs of 4+ spaces inside one.
+    expect(parameter.text.length).toBeGreaterThan(0);
+    expect(parameter.text.length).toBeLessThanOrEqual(1024);
+    expect(parameter.text).not.toMatch(/[\n\t]| {4}/);
+  }
+}
+
 export interface SentMessage {
   phoneNumberId: string;
   message: OutgoingMessage;
 }
 
+export interface SentTemplate {
+  phoneNumberId: string;
+  message: TemplateMessage;
+}
+
+/** A template send the test holds open, to simulate a worker that is stuck or dies mid-send. */
+export interface HeldSend {
+  /** Resolves once the held call has reached the client. */
+  started: Promise<void>;
+  /** Lets the held call finish: it succeeds, or rejects with `error`. */
+  release: (error?: Error) => void;
+}
+
+/** The body parameters of a template message, in order. */
+export function templateParams(sent: SentTemplate): string[] {
+  const body = sent.message.template.components[0];
+  return body ? body.parameters.map((parameter) => parameter.text) : [];
+}
+
 /** Records every outgoing message, checks WhatsApp limits on each one and can be told to fail. */
 export class FakeWhatsAppClient implements WhatsAppClient {
   readonly sent: SentMessage[] = [];
+  /** Every template accepted by `sendTemplate`. */
+  readonly templates: SentTemplate[] = [];
+  /** Specific errors the next `sendTemplate` calls reject with, in order. */
+  templateErrors: Error[] = [];
+  /** Every `sendTemplate` call, accepted or not (the number of Graph calls). */
+  templateCalls = 0;
+  /** Pause inside every `sendTemplate` call, to widen race windows. */
+  templateDelayMs = 0;
+  private holds: Array<{ gate: Promise<void>; onStart: () => void }> = [];
+
+  /** The next `sendTemplate` call blocks until the returned handle is released. */
+  holdNextTemplate(): HeldSend {
+    let onStart: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      onStart = resolve;
+    });
+    let release: (error?: Error) => void = () => undefined;
+    const gate = new Promise<void>((resolve, reject) => {
+      release = (error) => (error ? reject(error) : resolve());
+    });
+    this.holds.push({ gate, onStart });
+    return { started, release };
+  }
+
+  async sendTemplate(input: SentTemplate): Promise<{ messageId: string | null }> {
+    this.templateCalls += 1;
+    const hold = this.holds.shift();
+    if (hold) {
+      hold.onStart();
+      await hold.gate;
+    }
+    if (this.templateDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.templateDelayMs));
+    const next = this.templateErrors.shift();
+    if (next) throw next;
+    assertTemplateShape(input.message);
+    this.templates.push(input);
+    return { messageId: `wamid.template-${randomUUID()}` };
+  }
+
+  templatesTo(phone: string): SentTemplate[] {
+    return this.templates.filter((entry) => entry.message.to === phone);
+  }
+
   /** Number of upcoming `sendMessage` calls that reject. */
   failures = 0;
   /** Specific errors the next `sendMessage` calls reject with, in order (before `failures` applies). */

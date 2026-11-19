@@ -21,6 +21,22 @@ export type WhatsAppEnv = {
   phoneNumberId?: string;
 };
 
+/** Template language used when `WHATSAPP_TEMPLATE_LANGUAGE` is unset. */
+export const DEFAULT_TEMPLATE_LANGUAGE = "es";
+
+/** Names of the approved WhatsApp templates and their language. */
+export type ReminderTemplates = {
+  /** WHATSAPP_TEMPLATE_CONFIRMATION: sent right after an appointment is created. */
+  confirmation: string;
+  /** WHATSAPP_TEMPLATE_REMINDER: sent 24 h before the appointment. */
+  reminder: string;
+  /** WHATSAPP_TEMPLATE_LANGUAGE, for example `es` or `es_CO`. */
+  language: string;
+};
+
+/** Present only when reminders are enabled: WhatsApp is configured and both template names are set. */
+export type RemindersEnv = { templates: ReminderTemplates };
+
 export type ApiEnv = {
   databaseUrl: string;
   authSecret: string;
@@ -29,6 +45,8 @@ export type ApiEnv = {
   runMigrations: boolean;
   /** Absent when WhatsApp is not configured: the webhook routes then answer 404. */
   whatsapp?: WhatsAppEnv;
+  /** Absent when reminders are disabled: nothing is scheduled or sent. */
+  reminders?: RemindersEnv;
 };
 
 const WHATSAPP_REQUIRED = ["WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_TOKEN"] as const;
@@ -77,6 +95,39 @@ function readWhatsAppEnv(source: Record<string, string | undefined>): WhatsAppEn
   };
 }
 
+const TEMPLATE_VARIABLES = ["WHATSAPP_TEMPLATE_CONFIRMATION", "WHATSAPP_TEMPLATE_REMINDER"] as const;
+
+/** Meta template names: lowercase letters, digits and underscores. */
+const TEMPLATE_NAME = /^[a-z0-9_]{1,512}$/;
+/** Meta language codes: `es`, `en`, `es_CO`, `pt_BR`. */
+const TEMPLATE_LANGUAGE = /^[a-z]{2,3}(_[A-Z]{2})?$/;
+
+/**
+ * Reads the template names. Both unset means no reminders; exactly one set is a configuration mistake and throws
+ * (variable names only, never values). Whether reminders end up enabled also depends on WhatsApp being configured.
+ */
+function readTemplates(source: Record<string, string | undefined>): ReminderTemplates | undefined {
+  const present = TEMPLATE_VARIABLES.filter((name) => read(source, name) !== undefined);
+  if (present.length === 0) return undefined;
+
+  const missing = TEMPLATE_VARIABLES.filter((name) => read(source, name) === undefined);
+  if (missing.length > 0) {
+    throw new Error(
+      `Incomplete reminders configuration: ${TEMPLATE_VARIABLES.join(" and ")} must both be set or both be unset (missing: ${missing.join(", ")})`,
+    );
+  }
+
+  const confirmation = read(source, "WHATSAPP_TEMPLATE_CONFIRMATION") ?? "";
+  const reminder = read(source, "WHATSAPP_TEMPLATE_REMINDER") ?? "";
+  if (!TEMPLATE_NAME.test(confirmation)) throw new Error("WHATSAPP_TEMPLATE_CONFIRMATION must use only lowercase letters, digits and underscores");
+  if (!TEMPLATE_NAME.test(reminder)) throw new Error("WHATSAPP_TEMPLATE_REMINDER must use only lowercase letters, digits and underscores");
+
+  const language = read(source, "WHATSAPP_TEMPLATE_LANGUAGE") ?? DEFAULT_TEMPLATE_LANGUAGE;
+  if (!TEMPLATE_LANGUAGE.test(language)) throw new Error("WHATSAPP_TEMPLATE_LANGUAGE must look like es or es_CO");
+
+  return { confirmation, reminder, language };
+}
+
 /** Reads and validates the API environment, throwing a readable message. */
 export function readApiEnv(source: Record<string, string | undefined> = process.env): ApiEnv {
   const databaseUrl = source.DATABASE_URL;
@@ -88,6 +139,7 @@ export function readApiEnv(source: Record<string, string | undefined> = process.
   if (!authSecret) throw new Error("BETTER_AUTH_SECRET is required when NODE_ENV=production");
 
   const whatsapp = readWhatsAppEnv(source);
+  const templates = readTemplates(source);
 
   return {
     databaseUrl,
@@ -96,5 +148,7 @@ export function readApiEnv(source: Record<string, string | undefined> = process.
     port,
     runMigrations: source.RUN_MIGRATIONS === "true",
     ...(whatsapp ? { whatsapp } : {}),
+    // Reminders need a WhatsApp channel to send through: templates without it are ignored.
+    ...(whatsapp && templates ? { reminders: { templates } } : {}),
   };
 }

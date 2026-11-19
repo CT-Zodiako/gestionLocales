@@ -34,6 +34,11 @@ services:
       WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
       WHATSAPP_API_VERSION: ${WHATSAPP_API_VERSION:-}
       WHATSAPP_API_BASE_URL: ${WHATSAPP_API_BASE_URL:-}
+      # Reminders (approved WhatsApp templates, see the README): empty means disabled. Set both template names
+      # (and WhatsApp above) or neither; the language defaults to `es` when empty.
+      WHATSAPP_TEMPLATE_CONFIRMATION: ${WHATSAPP_TEMPLATE_CONFIRMATION:-}
+      WHATSAPP_TEMPLATE_REMINDER: ${WHATSAPP_TEMPLATE_REMINDER:-}
+      WHATSAPP_TEMPLATE_LANGUAGE: ${WHATSAPP_TEMPLATE_LANGUAGE:-}
     depends_on:
       postgres:
         condition: service_healthy

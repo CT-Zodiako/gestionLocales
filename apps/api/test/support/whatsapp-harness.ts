@@ -27,6 +27,7 @@ import {
   type Database,
   type schema,
 } from "@gestion/db";
+import type { SweepOptions, SweepSummary } from "../../src/reminders/sweep.ts";
 import { createServer, type Server } from "../../src/server.ts";
 import type { OutgoingMessage } from "../../src/whatsapp/messages.ts";
 import { createWhatsAppRoutes, type WhatsAppStore } from "../../src/whatsapp/webhook-routes.ts";
@@ -43,6 +44,9 @@ import {
 } from "./whatsapp.ts";
 
 export const MINUTE = 60_000;
+
+/** Template names and language the reminder tests configure; Meta only allows lowercase, digits and underscores. */
+export const TEMPLATES = { confirmation: "cita_confirmacion", reminder: "cita_recordatorio", language: "es" } as const;
 export const WEBHOOK = "/api/whatsapp/webhook";
 
 /** Monday 2031-03-10 08:00 in Bogotá (UTC-5). */
@@ -71,6 +75,8 @@ export interface Controls {
 export interface HarnessOptions {
   /** Route the webhook through a fault-injecting store (see `Controls`). */
   controlled?: boolean;
+  /** Enable reminders (the worker itself is never started; tests call `sweep`). */
+  reminders?: boolean;
 }
 
 export interface Harness {
@@ -80,8 +86,10 @@ export interface Harness {
   /** Stored idempotency marker of a message id, or null. */
   marker: (wamid: string) => Promise<{ businessId: string; receivedAt: Date; completedAt: Date | null } | null>;
   client: FakeWhatsAppClient;
-  /** Replaceable clock: every date the bot reasons about derives from it. */
+  /** Replaceable clock: every date the bot and the reminders reason about derives from it. */
   clock: { now: Date };
+  /** One reminder sweep, by default over the businesses this harness created (never other tests' businesses). */
+  sweep: (options?: SweepOptions) => Promise<SweepSummary>;
   logs: string[];
   /** Every business created through `newTenant`, removed by `close`. */
   businessIds: string[];
@@ -171,17 +179,13 @@ export async function createHarness(harnessOptions: HarnessOptions = {}): Promis
   const capture = (level: string) => (message: string, fields?: Record<string, unknown>) => {
     logs.push(`${level} ${message} ${fields ? JSON.stringify(fields) : ""}`);
   };
+  const logger = { info: capture("info"), warn: capture("warn"), error: capture("error") };
   const server = createServer({
     databaseUrl,
     authSecret,
     authUrl,
-    whatsapp: {
-      appSecret: APP_SECRET,
-      verifyToken: VERIFY_TOKEN,
-      client,
-      now: () => clock.now,
-      logger: { info: capture("info"), warn: capture("warn"), error: capture("error") },
-    },
+    whatsapp: { appSecret: APP_SECRET, verifyToken: VERIFY_TOKEN, client, now: () => clock.now, logger },
+    ...(harnessOptions.reminders ? { reminders: { templates: TEMPLATES, now: () => clock.now, logger } } : {}),
   });
   const businessIds: string[] = [];
   const controls: Controls = {
@@ -209,6 +213,10 @@ export async function createHarness(harnessOptions: HarnessOptions = {}): Promis
     marker: (wamid) => getWhatsappMessageMarker(server.db, wamid),
     client,
     clock,
+    sweep: (options) => {
+      if (!server.reminders) throw new Error("this harness was created without reminders");
+      return server.reminders.sweep({ businessIds, ...options });
+    },
     logs,
     businessIds,
     newTenant: (options) => createTenant(harness, options),

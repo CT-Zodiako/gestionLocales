@@ -304,7 +304,7 @@ stack, never in a tracked file.
 9. Add services and opening hours (the agenda API or the PWA), and send "hola" to the number from a phone.
 
 Replies are sent inside the 24-hour customer-service window that each incoming message opens, so no message
-template is needed; reminders (templates) are a later stage.
+template is needed; reminders are sent with approved templates, see "Reminders".
 
 ### Conversation
 
@@ -330,7 +330,7 @@ IANA name, `America/Bogota` by default), stepping by the service duration, never
 with `Intl.DateTimeFormat` (`apps/api/src/whatsapp/availability.ts`), so daylight-saving days have their real
 length. The booking still goes through `createAppointment`: if someone took the slot meanwhile the
 exclusion constraint rejects it and the customer gets "Ese horario se acaba de ocupar." with the slots again.
-Paging offsets are plain numbers (at most 4 digits) validated like every other id: a stale offset starts the list over and a malformed one is refused. All reply ids stay far below WhatsApp's 200-character limit. Without active services, without opening hours or without free slots the bot says so. Not built: reminders,
+Paging offsets are plain numbers (at most 4 digits) validated like every other id: a stale offset starts the list over and a malformed one is refused. All reply ids stay far below WhatsApp's 200-character limit. Without active services, without opening hours or without free slots the bot says so. Not built:
 payments, media, free-text understanding, human handoff. There is no limit on how many appointments one
 number can book.
 
@@ -424,6 +424,103 @@ To tap a button, send an `interactive` message instead of `text`:
 Afterwards restart the stack without the variables (`docker compose up -d`) and remove the test business
 rows if you created any.
 
+## Reminders
+
+The API sends two WhatsApp **template** messages per appointment: a **confirmation** right after it is created
+(from the PWA or from the bot) and a **reminder 24 hours before** it starts. Templates are needed because the
+business starts these conversations outside the 24-hour customer-service window. A pg-boss worker running inside
+the API process does the sending (code: `apps/api/src/reminders/`; SQL: `packages/db/src/reminders.ts`).
+
+**Status of verification: built and tested with a fake WhatsApp client and simulated time only. Real delivery was
+not verified against Meta**: template approval, the Graph API answer shape and the category/pricing Meta
+applies still have to be checked with the real account.
+
+### Enabling it
+
+| Variable | Needed | Meaning |
+|---|---|---|
+| `WHATSAPP_TEMPLATE_CONFIRMATION` | for reminders | Name of the approved confirmation template, e.g. `cita_confirmacion` |
+| `WHATSAPP_TEMPLATE_REMINDER` | for reminders | Name of the approved 24-hour reminder template, e.g. `cita_recordatorio` |
+| `WHATSAPP_TEMPLATE_LANGUAGE` | no | Language code of both templates, `es` by default (`es_CO`, `en_US`, ...) |
+
+Reminders are **on only when WhatsApp is enabled (the three `WHATSAPP_*` variables) and both template names are
+set**. Template names use lowercase letters, digits and underscores (what Meta allows). Setting exactly one
+of the two names makes the API refuse to start and say which is missing (names only, never values). With reminders
+off, nothing is scheduled or sent, appointments, the PWA and the bot work exactly as before, and no error is
+raised; templates set without WhatsApp are ignored. `docker-compose.yml` passes the three variables with empty
+defaults. At start the API logs `Reminders enabled` or `Reminders disabled`; if the pg-boss worker cannot start
+(for example the database user may not create the `pgboss` schema) the API exits with an error instead of
+running without reminders.
+
+### Creating the two templates in Meta
+
+In [Meta Business Manager](https://business.facebook.com) open **WhatsApp Manager > Account tools > Message
+templates > Create template** (the same WhatsApp Business account as the sending number; menu names may differ slightly in Meta's current UI), and create both:
+
+| Field | Confirmation | Reminder |
+|---|---|---|
+| **Category** | **Utility** (not Marketing, not Authentication) | **Utility** |
+| **Name** | the value of `WHATSAPP_TEMPLATE_CONFIRMATION`, e.g. `cita_confirmacion` | the value of `WHATSAPP_TEMPLATE_REMINDER`, e.g. `cita_recordatorio` |
+| **Language** | Spanish (`es`), or the code you put in `WHATSAPP_TEMPLATE_LANGUAGE` | same |
+| **Header / footer / buttons** | none | none |
+| **Body** | `Hola {{1}}, tu cita de {{2}} quedó confirmada para el {{3}} a las {{4}}.` | `Hola {{1}}, te recordamos tu cita de {{2}} mañana, {{3}} a las {{4}}.` |
+
+Meta asks for an example value for each variable; use for instance `Ana`, `Corte`, `13/03/2031`, `09:00`. Submit
+both and wait for the status **Approved**: only approved templates can be sent. The wording above is a
+suggestion; keep the four variables `{{1}}` to `{{4}}`, in this order, because the API fills exactly these four
+**body** parameters (text), in the business's timezone (`businesses.timezone`):
+
+| Variable | Value | Example |
+|---|---|---|
+| `{{1}}` | customer name (`cliente` when the customer has none) | `Ana` |
+| `{{2}}` | service name | `Corte` |
+| `{{3}}` | appointment date, `dd/mm/yyyy` | `13/03/2031` |
+| `{{4}}` | appointment time, `HH:mm` (24 h) | `09:00` |
+
+Names and service names are collapsed to one line and cut at 60 characters. The request the API sends is the
+Graph API `messages` call with `"type": "template"`, `template.name`, `template.language.code` and one `body`
+component with those four text parameters. A template with a different number of variables, header variables or
+buttons that need parameters is expected to be refused by Meta with a `4xx` (permanent, so the reminder is marked `failed`); this was not exercised against Meta.
+
+### How it works
+
+- **Table `appointment_reminders`** (migration `0005`) is the source of truth: one row per appointment and
+  kind (`confirmation`, `reminder_24h`; unique together), `due_at`, `status` (`pending`, `sending`, `sent`,
+  `failed`, `skipped`), `attempts`, `claimed_at` (the lease), `sent_at`, `whatsapp_message_id` and `last_error`
+  (a short description such as `WhatsApp send failed with status 503`: never a phone number, name or token). It
+  references the appointment with a composite key `(appointment_id, business_id)`, so a reminder cannot point at
+  another business's appointment.
+- **Scheduling.** `createAppointment` (shared by the agenda API and the bot) inserts the appointment and its
+  reminders in one transaction: the confirmation due now and the 24-hour reminder due `starts_at - 24 h`; that
+  one is left out when it would not be in the future (an appointment less than 24 h away gets only the
+  confirmation), and an appointment already in the past gets none. Cancelling (PWA or bot) turns the **pending**
+  reminders into `skipped`. Moving an appointment re-times only the 24-hour reminder (and skips it if its new
+  time is already past, or creates it if the appointment is now far enough away); the confirmation is **not**
+  sent again for the new time. A reminder already sent stays as it is.
+- **Sweep.** A pg-boss schedule `reminders-sweep` runs every minute (pg-boss keeps its own tables in the
+  `pgboss` schema of the same database; the first start creates it, so the database user needs `CREATE` on the
+  database). A sweep claims due rows in one statement (`pending` -> `sending` with `claimed_at`, `FOR UPDATE SKIP
+  LOCKED`) **before** calling WhatsApp, so concurrent sweeps (several API instances, overlapping runs) never send the
+  same row. At send time it checks again that the appointment is still `booked` and in the future, the customer
+  has a phone and the business has a row in `whatsapp_channels` (otherwise the reminder is `skipped` with the
+  reason in `last_error`), then sends the template through the business's number.
+- **Retries.** Transient failures (network error, timeout, `5xx`, `408`, `429`, the same classification as the
+  webhook) put the row back to `pending` with a backoff of 1, 5 and 30 minutes, up to 4 attempts in total, then
+  `failed`. Any other `4xx` (invalid token, rejected template, unknown number) is permanent: `failed` at once.
+  Nothing retries a `failed` row; fix the cause and, if you still want to send it, set its status back to
+  `pending` and `attempts` to `0` by hand.
+- **Crashes.** A row left `sending` for more than 5 minutes (the process died mid-send) is claimed again by the
+  next sweep, which counts as another attempt; a row that keeps dying is `failed` after the 4th. **Limit:** if the
+  process dies *after* WhatsApp accepted the message but *before* the row was marked `sent`, the message is sent
+  once more after the lease. Closing that gap would need an idempotency key that Meta honours; this implementation does not have one.
+  A worker whose lease was taken over cannot overwrite the new owner's result.
+- **Logs** carry reminder and appointment ids, the kind, the attempt and an error kind; never phone numbers,
+  customer names or tokens.
+
+Shutdown (`SIGTERM`/`SIGINT`) stops the worker gracefully (a running sweep gets 10 seconds) before the database
+connection closes. Tests call the exported `sweepReminders` directly with a fake client and an injected clock;
+one integration test starts pg-boss against the test database in a scratch schema.
+
 ## Data model
 
 Every table carries `business_id` (foreign key to `businesses`), so the app can
@@ -438,10 +535,12 @@ data-layer functions: `packages/db/src/agenda.ts`.
 | `appointments` | `customer_id`, `service_id`, `starts_at` < `ends_at` (`timestamptz`), `status` `booked` or `cancelled` |
 | `whatsapp_channels` | WhatsApp `phone_number_id` (unique) of a business; routes webhook messages to it |
 | `whatsapp_processed_messages` | one row per WhatsApp `wamid` (primary key): the webhook's idempotency marker and 2-minute lease (`completed_at` is set when handling finished) |
+| `appointment_reminders` | confirmation and 24-hour reminder of each appointment: `kind`, `due_at`, `status`, `attempts`, lease and result (see "Reminders"); unique per appointment + kind |
 
 An appointment can only reference a customer and a service of its own business:
 `customers` and `services` are unique on `(id, business_id)`, and `appointments`
 has composite foreign keys `(customer_id, business_id)` and `(service_id, business_id)`.
+`appointments` is itself unique on `(id, business_id)` so that `appointment_reminders` can use the same pattern.
 
 No-overlap rule: each business has a single agenda, and a Postgres exclusion
 constraint (`appointments_no_overlap`, `btree_gist`) rejects two non-cancelled
@@ -492,6 +591,8 @@ pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
 | `WHATSAPP_APP_SECRET` / `WHATSAPP_VERIFY_TOKEN` / `WHATSAPP_TOKEN` | api | none (all three unset disables the WhatsApp webhook; some but not all refuses to start); empty in compose |
 | `WHATSAPP_PHONE_NUMBER_ID` | api (informational), whatsapp:link CLI | none; empty in compose |
 | `WHATSAPP_API_VERSION` / `WHATSAPP_API_BASE_URL` | api | `v23.0` / `https://graph.facebook.com`; empty in compose |
+| `WHATSAPP_TEMPLATE_CONFIRMATION` / `WHATSAPP_TEMPLATE_REMINDER` | api | none (both unset, or WhatsApp disabled, turns reminders off; exactly one set refuses to start); empty in compose |
+| `WHATSAPP_TEMPLATE_LANGUAGE` | api | `es`; empty in compose |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | `gestion` |
 | `POSTGRES_PORT` | compose (host port) | `5433` |
 

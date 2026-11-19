@@ -96,6 +96,38 @@ export interface InteractiveMessage extends MessageBase {
 /** A message in the exact shape the Graph API `/messages` endpoint takes. */
 export type OutgoingMessage = TextMessage | InteractiveMessage;
 
+/** A pre-approved template message: the only kind WhatsApp lets a business start outside the 24 h customer window. */
+export interface TemplateMessage extends MessageBase {
+  type: "template";
+  template: {
+    name: string;
+    language: { code: string };
+    components: Array<{ type: "body"; parameters: Array<{ type: "text"; text: string }> }>;
+  };
+}
+
+export interface TemplateMessageInput {
+  to: string;
+  /** Template name as approved in Meta Business Manager. */
+  name: string;
+  /** Template language code, for example `es`. */
+  language: string;
+  /** Values of the body variables `{{1}}`, `{{2}}`, ... in order. */
+  bodyParameters: string[];
+}
+
+export function templateMessage(input: TemplateMessageInput): TemplateMessage {
+  return {
+    ...base(input.to),
+    type: "template",
+    template: {
+      name: input.name,
+      language: { code: input.language },
+      components: [{ type: "body", parameters: input.bodyParameters.map((text) => ({ type: "text", text })) }],
+    },
+  };
+}
+
 function base(to: string): MessageBase {
   return { messaging_product: "whatsapp", recipient_type: "individual", to };
 }

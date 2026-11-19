@@ -15,7 +15,8 @@
     "@gestion/shared": "workspace:*",
     "@hono/node-server": "2.1.8",
     "better-auth": "^1.7.25",
-    "hono": "^4.13.19"
+    "hono": "^4.13.19",
+    "pg-boss": "12.38.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
