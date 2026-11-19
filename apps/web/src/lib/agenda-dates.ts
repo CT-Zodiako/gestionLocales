@@ -17,6 +17,11 @@ export function parseDateKey(key: string): Date {
   return new Date(year, month - 1, day);
 }
 
+/** `HH:MM` (24 h) of an instant in the browser timezone, the value format of `<input type="time">`. */
+export function toTimeKey(date: Date): string {
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 export function todayKey(): string {
   return toDateKey(new Date());
 }

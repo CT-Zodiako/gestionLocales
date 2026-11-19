@@ -1,10 +1,19 @@
 import {
   type AppointmentDetailResponse,
+  type AppointmentResponse,
+  appointmentSchema,
+  type CreateAppointmentBody,
+  type CreateServiceBody,
+  errorResponseSchema,
   type HealthResponse,
   healthResponseSchema,
   listAppointmentsResponseSchema,
+  listServicesResponseSchema,
   type MeResponse,
   meResponseSchema,
+  type MoveAppointmentBody,
+  type ServiceResponse,
+  serviceSchema,
 } from "@gestion/shared";
 
 export async function fetchHealth(): Promise<HealthResponse> {
@@ -63,4 +72,53 @@ export async function fetchAppointments(from: string, to: string): Promise<Appoi
   if (!res.ok) throw new HttpError(`GET /api/appointments failed with ${res.status}`, res.status);
 
   return listAppointmentsResponseSchema.parse(await res.json()).appointments;
+}
+
+/** A failed agenda API call: `code` is the `{"error": "<code>"}` of the answer (`slot_taken`, `not_found`, ...), or null. */
+export class ApiError extends HttpError {
+  readonly code: string | null;
+
+  constructor(message: string, status: number, code: string | null) {
+    super(message, status);
+    this.name = "ApiError";
+    this.code = code;
+  }
+}
+
+async function apiError(res: Response, description: string): Promise<ApiError> {
+  const body = errorResponseSchema.safeParse(await res.json().catch(() => null));
+  return new ApiError(`${description} failed with ${res.status}`, res.status, body.success ? body.data.error : null);
+}
+
+/** Sends one JSON request to the agenda API; any non-2xx answer becomes an `ApiError`. */
+async function sendJson(method: string, path: string, body?: unknown): Promise<unknown> {
+  const res = await fetch(path, {
+    method,
+    ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+  });
+  if (!res.ok) throw await apiError(res, `${method} ${path}`);
+  return res.json();
+}
+
+/** POST /api/appointments; 404 `not_found` (service), 409 `slot_taken`, 400 `invalid_request`. */
+export async function createAppointment(body: CreateAppointmentBody): Promise<AppointmentResponse> {
+  return appointmentSchema.parse(await sendJson("POST", "/api/appointments", body));
+}
+
+/** PATCH /api/appointments/:id: moves it keeping its duration; 404 `not_found`, 409 `slot_taken`. */
+export async function moveAppointment(id: string, body: MoveAppointmentBody): Promise<AppointmentResponse> {
+  return appointmentSchema.parse(await sendJson("PATCH", `/api/appointments/${id}`, body));
+}
+
+/** POST /api/appointments/:id/cancel; 404 `not_found` when it is missing or already cancelled. */
+export async function cancelAppointment(id: string): Promise<AppointmentResponse> {
+  return appointmentSchema.parse(await sendJson("POST", `/api/appointments/${id}/cancel`));
+}
+
+export async function fetchServices(): Promise<ServiceResponse[]> {
+  return listServicesResponseSchema.parse(await sendJson("GET", "/api/services")).services;
+}
+
+export async function createService(body: CreateServiceBody): Promise<ServiceResponse> {
+  return serviceSchema.parse(await sendJson("POST", "/api/services", body));
 }

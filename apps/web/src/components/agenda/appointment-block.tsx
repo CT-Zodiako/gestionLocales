@@ -1,5 +1,8 @@
+import type { AppointmentDetailResponse } from "@gestion/shared";
 import { cn } from "@/lib/utils.ts";
 import { formatTime } from "@/lib/agenda-dates.ts";
+import { rememberOpener } from "@/lib/focus-return.ts";
+import { useAgendaStore } from "@/stores/agenda-store.ts";
 import type { PlacedBlock } from "./layout.ts";
 
 /** Pixels per hour of the time grid; a block's top and height derive from it. */
@@ -8,8 +11,7 @@ export const HOUR_PX = 64;
 /** A block taller than this (in minutes) has room for a second line. */
 const TWO_LINE_MINUTES = 45;
 
-export function customerLabel(block: PlacedBlock): string {
-  const { customerName, customerPhone } = block.appointment;
+export function customerLabel({ customerName, customerPhone }: AppointmentDetailResponse): string {
   return customerName ?? `+${customerPhone}`;
 }
 
@@ -24,20 +26,25 @@ export function AppointmentBlock({ block, gridStartMin, compact }: AppointmentBl
   const { appointment } = block;
   const cancelled = appointment.status === "cancelled";
   const durationMin = block.endMin - block.startMin;
-  const name = customerLabel(block);
+  const name = customerLabel(appointment);
+  const openDetail = useAgendaStore((state) => state.openDetail);
   const time = `${formatTime(new Date(appointment.startsAt))}–${formatTime(new Date(appointment.endsAt))}`;
   const summary = `${name}, ${appointment.serviceName}, ${time}${cancelled ? ", cancelada" : ""}`;
   const roomy = !compact && durationMin >= TWO_LINE_MINUTES;
 
   return (
-    <div
+    <button
+      type="button"
       data-testid="appointment-block"
       data-status={appointment.status}
-      role="group"
       aria-label={summary}
       title={summary}
+      onClick={(event) => {
+        rememberOpener(event.currentTarget);
+        openDetail(appointment);
+      }}
       className={cn(
-        "absolute overflow-hidden rounded-md border border-background border-l-4 px-1 text-left",
+        "absolute cursor-pointer overflow-hidden rounded-md border border-background border-l-4 px-1 text-left outline-none focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-ring",
         compact ? "py-0.5 text-[10px] leading-3" : "px-2 py-1 text-xs leading-4",
         cancelled
           ? "border-l-muted-foreground bg-muted text-muted-foreground line-through"
@@ -51,22 +58,22 @@ export function AppointmentBlock({ block, gridStartMin, compact }: AppointmentBl
       }}
     >
       {compact ? (
-        <p className="line-clamp-2 font-medium break-words">{name}</p>
+        <span className="line-clamp-2 block font-medium break-words">{name}</span>
       ) : roomy ? (
         <>
-          <p className="truncate font-medium">{name}</p>
-          <p className="truncate">{appointment.serviceName}</p>
-          <p className="truncate">
+          <span className="block truncate font-medium">{name}</span>
+          <span className="block truncate">{appointment.serviceName}</span>
+          <span className="block truncate">
             {time}
             {cancelled && <span className="no-underline"> · Cancelada</span>}
-          </p>
+          </span>
         </>
       ) : (
-        <p className="truncate">
+        <span className="block truncate">
           <span className="font-medium">{name}</span> · {appointment.serviceName}
           {cancelled && " · Cancelada"}
-        </p>
+        </span>
       )}
-    </div>
+    </button>
   );
 }

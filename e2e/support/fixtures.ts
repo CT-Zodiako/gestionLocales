@@ -1,4 +1,5 @@
-import { expect, test as base, type Locator, type Page } from "@playwright/test";
+import { expect, test as base, type APIRequestContext, type Locator, type Page } from "@playwright/test";
+import { instant } from "./dates.ts";
 import { readState, type E2eState } from "./seed.ts";
 
 type Credentials = { email: string; password: string; businessName: string };
@@ -12,6 +13,7 @@ export class AgendaPage {
   readonly dayToggle: Locator;
   readonly weekToggle: Locator;
   readonly cancelledToggle: Locator;
+  readonly newAppointment: Locator;
   readonly rangeLabel: Locator;
   readonly logout: Locator;
 
@@ -23,6 +25,7 @@ export class AgendaPage {
     this.dayToggle = page.getByRole("radio", { name: "Día" });
     this.weekToggle = page.getByRole("radio", { name: "Semana" });
     this.cancelledToggle = page.getByRole("button", { name: "Canceladas" });
+    this.newAppointment = page.getByRole("button", { name: "Nueva cita", exact: true });
     this.rangeLabel = page.getByTestId("range-label");
     this.logout = page.getByRole("button", { name: "Cerrar sesión" });
   }
@@ -76,10 +79,69 @@ export class AgendaPage {
   hourRow(hour: string): Locator {
     return this.page.getByTestId(`hour-${hour}`);
   }
+
+  /** The empty-slot button of an hour (`14`) in the day view. */
+  slot(hour: string): Locator {
+    return this.page.getByRole("button", { name: `Agendar a las ${hour}:00`, exact: true });
+  }
+
+  /**
+   * Asserts a block sits at `hour:minute` of the day view and spans `durationMin`, measured against the hour rows
+   * (an hour row is the grid's scale), within a small tolerance for borders.
+   */
+  async expectBlockAt(block: Locator, hour: string, minute: number, durationMin: number): Promise<void> {
+    const row = await this.hourRow(hour).boundingBox();
+    const box = await block.boundingBox();
+    expect(row && box).toBeTruthy();
+    expect(Math.abs(box!.y - (row!.y + (minute / 60) * row!.height))).toBeLessThanOrEqual(2);
+    expect(Math.abs(box!.height - (durationMin / 60) * row!.height)).toBeLessThanOrEqual(2);
+  }
+}
+
+/** One appointment as the API lists it (only what the specs read). */
+export type ApiAppointment = { id: string; customerId: string; customerPhone: string; startsAt: string; endsAt: string; status: string };
+
+/** The seeded owner's API session, to arrange and inspect data without going through the UI. */
+export class AgendaApi {
+  constructor(private readonly request: APIRequestContext) {}
+
+  async serviceId(name: string): Promise<string> {
+    const { services } = (await (await this.request.get("/api/services")).json()) as { services: { id: string; name: string }[] };
+    const service = services.find((candidate) => candidate.name === name);
+    if (!service) throw new Error(`Service ${name} is not seeded`);
+    return service.id;
+  }
+
+  /** Books `service` at `time` (`HH:MM`) on `date` (`YYYY-MM-DD`, e2e timezone) and returns the appointment id. */
+  async book(service: string, date: string, time: string, phone: string, name?: string): Promise<string> {
+    const res = await this.request.post("/api/appointments", {
+      data: {
+        serviceId: await this.serviceId(service),
+        startsAt: instant(date, time),
+        customerPhone: phone,
+        ...(name ? { customerName: name } : {}),
+      },
+    });
+    if (!res.ok()) throw new Error(`POST /api/appointments failed with ${res.status()}: ${await res.text()}`);
+    return ((await res.json()) as { id: string }).id;
+  }
+
+  async cancel(id: string): Promise<void> {
+    const res = await this.request.post(`/api/appointments/${id}/cancel`);
+    if (!res.ok()) throw new Error(`cancel failed with ${res.status()}`);
+  }
+
+  /** Every appointment (any status) that starts on `date` in the e2e timezone. */
+  async onDate(date: string, nextDate: string): Promise<ApiAppointment[]> {
+    const query = new URLSearchParams({ from: instant(date, "00:00"), to: instant(nextDate, "00:00") });
+    const res = await this.request.get(`/api/appointments?${query}`);
+    return ((await res.json()) as { appointments: ApiAppointment[] }).appointments;
+  }
 }
 
 type Fixtures = {
   state: E2eState;
+  api: AgendaApi;
   agenda: AgendaPage;
   consoleErrors: string[];
 };
@@ -96,6 +158,15 @@ export const test = base.extend<Fixtures>({
   // eslint-disable-next-line no-empty-pattern
   state: async ({}, use) => {
     await use(readState());
+  },
+  api: async ({ playwright, baseURL, state }, use) => {
+    const request = await playwright.request.newContext({
+      baseURL,
+      storageState: state.storageStatePath,
+      extraHTTPHeaders: { origin: baseURL as string },
+    });
+    await use(new AgendaApi(request));
+    await request.dispose();
   },
   consoleErrors: async ({ page }, use) => {
     const errors: string[] = [];

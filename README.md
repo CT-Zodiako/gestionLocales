@@ -134,9 +134,10 @@ curl -s -b jar -X PUT -H 'content-type: application/json' \
 ## Web app
 
 After login (`/login`), `/` shows the agenda: the business name and logout in the
-header, date navigation (previous / today / next), a day|week toggle and a
-"Canceladas" toggle. The UI is in Spanish and mobile-first (checked at 375 px);
-times are shown in the browser's timezone.
+header, a "Nueva cita" button, date navigation (previous / today / next), a
+day|week toggle and a "Canceladas" toggle. The UI is in Spanish and mobile-first
+(checked at 375 px, 40 px touch targets); times are entered and shown in the
+browser's timezone.
 
 - **Day view**: a scrollable time grid from 07:00 to 21:00 (it grows when an
   appointment falls outside that window). Each appointment is a block positioned
@@ -147,16 +148,49 @@ times are shown in the browser's timezone.
   them muted (grey, struck through, labelled "Cancelada").
 - Loading, empty ("No hay citas para este día.") and error states; the error
   state has a "Reintentar" button, and it also appears when the browser is
-  offline (the appointments query always attempts the request). This view is read-only: creating, moving and
-  cancelling come later.
+  offline (the appointments query always attempts the request).
 - State: the selected date, the view and the cancelled toggle live in a Zustand
   store (`apps/web/src/stores/agenda-store.ts`, UI state only); the appointments
   come from `GET /api/appointments?from&to` through TanStack Query, with the
   visible range in the query key. Signing in or out clears the whole query cache,
   so a second owner in the same tab never sees the previous owner's data.
 - UI components are shadcn/ui (Radix, Tailwind 4) under `apps/web/src/components/ui`
-  (`button`, `toggle`, `toggle-group`); add more with
+  (`button`, `toggle`, `toggle-group`, `dialog`, `input`, `label`, `select`); add more with
   `pnpm dlx shadcn@latest add <component>` inside `apps/web`.
+
+### Creating, moving and cancelling appointments
+
+Forms use React Hook Form with Zod. The validation schemas live in
+`apps/web/src/lib/appointment-forms.ts` and reuse the shared ones (`phoneSchema`,
+`instantSchema` and the request body schemas of `@gestion/shared`); the writes are TanStack Query
+mutations (`apps/web/src/lib/appointments.ts`) that wait for the refetch of the appointment
+queries before the dialog closes, and the `fetch` helpers with their typed `ApiError`
+(`status` and the API's `code`) are in `apps/web/src/lib/api.ts`.
+
+- **Nueva cita**: the toolbar button, or a tap/click on an empty hour of the day grid (the
+  hour is prefilled; these hour targets are for the pointer, keyboard users have the toolbar
+  button). The dialog asks for the customer phone (spaces, dashes, parentheses and a leading
+  `+` are accepted; 8 to 15 digits), an optional name, the service, the date and the time, and
+  shows the end time from the service duration. The date and time are in the browser timezone and are
+  sent as an ISO instant. After a booking (or a move) to a day that is not on screen the agenda
+  jumps to that day.
+- **Nuevo servicio**: while the business has no (active) services the booking dialog shows an inline form
+  (name, duration in minutes) that calls `POST /api/services` and selects the new service. It is the only
+  place services are created from the UI; editing them is not available yet.
+- **Detail**: clicking or pressing Enter on an appointment block opens its detail with
+  **Mover** (date and time form; the duration is kept) and **Cancelar cita** (asks for a
+  confirmation first; "No, volver" keeps it). A cancelled appointment (shown with the toggle)
+  opens read-only.
+- **Errors** keep the dialog open and everything typed: a client-side validation message under
+  each field (announced with `role="alert"`, no request is sent); `409` "Ese horario ya está ocupado";
+  `404` (the appointment was cancelled meanwhile, or the service no longer exists) says so and refreshes the
+  agenda (or the services); `400` shows one message for the whole form (the API answers
+  `invalid_request` without field details, so field messages come from the client schemas);
+  anything else (500, network) shows "Ocurrió un error. Inténtalo de nuevo.".
+- **Accessibility**: labelled controls, focus moves into the dialog and returns to the button, hour or
+  block that opened it (also when that block is gone, then to the agenda), Escape closes, a tap outside
+  does not (so typed data is not lost), and while a request is in flight the submit button is disabled
+  and the dialog cannot be closed, so a double click sends one request.
 
 Run it with the Docker stack (above) at http://localhost:8080, or in development
 (see "Local development") at http://localhost:5173.
@@ -189,6 +223,13 @@ pnpm install
 pnpm exec playwright install chromium   # once
 pnpm e2e
 ```
+
+Specs, run in alphabetical order: `e2e/agenda.spec.ts` (views, navigation, login),
+`e2e/appointments.spec.ts` (create, move, cancel, errors, keyboard and 375 px, through the real UI),
+`e2e/logout.spec.ts` (signing out ends the shared session, so it must come after the specs that use it),
+`e2e/pwa.spec.ts`.
+`e2e/appointments.spec.ts` arranges its data through the API at hours and days the other specs do not use,
+and blocks the service worker so `page.route` can reliably fake server errors.
 
 Global setup creates two uniquely named owners (A and B, each with its own
 business) with the auth CLI

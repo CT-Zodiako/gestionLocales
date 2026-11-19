@@ -1,3 +1,5 @@
+import { BookingDialog } from "@/components/agenda/booking-dialog.tsx";
+import { AppointmentDetailDialog } from "@/components/agenda/detail-dialog.tsx";
 import { AgendaHeader } from "@/components/agenda/agenda-header.tsx";
 import { AgendaToolbar } from "@/components/agenda/agenda-toolbar.tsx";
 import { AgendaView } from "@/components/agenda/agenda-view.tsx";
@@ -16,6 +18,8 @@ export function HomePage() {
       >
         <AgendaView />
       </main>
+      <BookingDialog />
+      <AppointmentDetailDialog />
     </div>
   );
 }

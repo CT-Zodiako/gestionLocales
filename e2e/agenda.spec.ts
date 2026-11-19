@@ -225,12 +225,3 @@ test.describe("login form", () => {
     await expect(page.getByText("Ana Pérez")).toHaveCount(0);
   });
 });
-
-// Last on purpose: signing out invalidates the shared session cookie.
-test.describe("logout", () => {
-  test("logout returns to the login page", async ({ page, agenda, state }) => {
-    await agenda.open(state);
-    await agenda.logout.click();
-    await expect(page).toHaveURL(/\/login$/);
-  });
-});

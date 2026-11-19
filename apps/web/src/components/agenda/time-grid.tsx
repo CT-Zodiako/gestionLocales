@@ -1,6 +1,8 @@
 import type { AppointmentDetailResponse } from "@gestion/shared";
 import { cn } from "@/lib/utils.ts";
 import { dayOfMonth, formatDayLabel, formatWeekdayShort, todayKey } from "@/lib/agenda-dates.ts";
+import { rememberOpener } from "@/lib/focus-return.ts";
+import { useAgendaStore } from "@/stores/agenda-store.ts";
 import { AppointmentBlock, HOUR_PX } from "./appointment-block.tsx";
 import { gridHours, placeDay } from "./layout.ts";
 
@@ -16,6 +18,7 @@ export function TimeGrid({ days, appointments }: TimeGridProps) {
   const { startHour, endHour } = gridHours(columns.flatMap((column) => column.blocks));
   const hours = Array.from({ length: endHour - startHour }, (_, index) => startHour + index);
   const today = todayKey();
+  const openBooking = useAgendaStore((state) => state.openBooking);
 
   return (
     <div
@@ -61,9 +64,27 @@ export function TimeGrid({ days, appointments }: TimeGridProps) {
 
       {columns.map(({ day, blocks }) => (
         <div key={day} data-testid={`day-${day}`} className="relative border-l" style={{ height: hours.length * HOUR_PX }}>
-          {hours.map((hour) => (
-            <div key={hour} className="border-t first:border-t-0" style={{ height: HOUR_PX }} />
-          ))}
+          {hours.map((hour) => {
+            const label = `${String(hour).padStart(2, "0")}:00`;
+            // Day view: an empty hour is a tap target that opens the booking dialog at that time. Keyboard users have
+            // "Nueva cita" in the toolbar, so these stay out of the Tab order (they remain reachable by assistive tech).
+            return compact ? (
+              <div key={hour} className="border-t first:border-t-0" style={{ height: HOUR_PX }} />
+            ) : (
+              <button
+                key={hour}
+                type="button"
+                tabIndex={-1}
+                aria-label={`Agendar a las ${label}`}
+                className="block w-full cursor-pointer border-t outline-none first:border-t-0 hover:bg-muted/60 focus-visible:bg-muted/60"
+                style={{ height: HOUR_PX }}
+                onClick={(event) => {
+                  rememberOpener(event.currentTarget);
+                  openBooking({ date: day, time: label });
+                }}
+              />
+            );
+          })}
           {blocks.map((block) => (
             <AppointmentBlock
               key={block.appointment.id}

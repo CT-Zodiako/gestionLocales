@@ -1,8 +1,9 @@
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button.tsx";
 import { Toggle } from "@/components/ui/toggle.tsx";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group.tsx";
 import { formatRangeLabel, type AgendaView } from "@/lib/agenda-dates.ts";
+import { rememberOpener } from "@/lib/focus-return.ts";
 import { useAgendaStore } from "@/stores/agenda-store.ts";
 
 export function AgendaToolbar() {
@@ -13,13 +14,27 @@ export function AgendaToolbar() {
   const setShowCancelled = useAgendaStore((state) => state.setShowCancelled);
   const goToToday = useAgendaStore((state) => state.goToToday);
   const shift = useAgendaStore((state) => state.shift);
+  const openBooking = useAgendaStore((state) => state.openBooking);
   const unit = view === "week" ? "semana" : "día";
 
   return (
     <div className="flex flex-col gap-2 border-b px-3 py-2">
-      <p data-testid="range-label" aria-live="polite" className="text-sm font-medium">
-        {formatRangeLabel(view, selectedDate)}
-      </p>
+      <div className="flex items-center justify-between gap-2">
+        <p data-testid="range-label" aria-live="polite" className="min-w-0 text-sm font-medium">
+          {formatRangeLabel(view, selectedDate)}
+        </p>
+        <Button
+          type="button"
+          className="h-10 shrink-0 px-3"
+          onClick={(event) => {
+            rememberOpener(event.currentTarget);
+            openBooking();
+          }}
+        >
+          <Plus />
+          Nueva cita
+        </Button>
+      </div>
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex items-center gap-1">
