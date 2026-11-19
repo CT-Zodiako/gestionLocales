@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createFetchWhatsAppClient, isPermanentSendError, WhatsAppSendError } from "../src/whatsapp/client.ts";
+import { createFetchWhatsAppClient, isAuthSendError, isPermanentSendError, WhatsAppSendError } from "../src/whatsapp/client.ts";
 import { templateMessage } from "../src/whatsapp/messages.ts";
 import { ACCESS_TOKEN } from "./support/whatsapp.ts";
 
@@ -97,5 +97,41 @@ describe("createFetchWhatsAppClient.sendTemplate", () => {
 
     await expect(client.sendTemplate({ phoneNumberId: "../evil", message: templateMessage(input) })).rejects.toThrow("Invalid phone number id");
     expect(calls).toEqual([]);
+  });
+});
+
+describe("isAuthSendError", () => {
+  it.each([
+    [new WhatsAppSendError(401), true],
+    [new WhatsAppSendError(403), true],
+    [new WhatsAppSendError(400, 190), true],
+    [new WhatsAppSendError(401, 190), true],
+    [new WhatsAppSendError(400), false],
+    [new WhatsAppSendError(400, 132001), false],
+    [new WhatsAppSendError(404), false],
+    [new WhatsAppSendError(429), false],
+    [new WhatsAppSendError(500), false],
+    [new Error("401"), false],
+    [new TypeError("fetch failed"), false],
+    ["401", false],
+  ])("classifies %o as auth=%s", (error, expected) => {
+    expect(isAuthSendError(error)).toBe(expected);
+  });
+
+  it("keeps 401 and 403 permanent for the webhook's own classification", () => {
+    expect(isPermanentSendError(new WhatsAppSendError(401))).toBe(true);
+    expect(isPermanentSendError(new WhatsAppSendError(403))).toBe(true);
+  });
+
+  it("recognises a Graph code 190 answer from the real client, keeping the code on the error and the token out of its message", async () => {
+    const body = { error: { message: `Error validating access token ${ACCESS_TOKEN}`, type: "OAuthException", code: 190 } };
+    const { fetchImpl } = fakeFetch(() => Response.json(body, { status: 400 }));
+    const client = createFetchWhatsAppClient({ token: ACCESS_TOKEN, apiVersion: "v23.0", fetch: fetchImpl });
+
+    const failure = await client.sendTemplate({ phoneNumberId: "42", message: templateMessage(input) }).catch((error: unknown) => error);
+
+    expect(isAuthSendError(failure)).toBe(true);
+    expect((failure as WhatsAppSendError).graphCode).toBe(190);
+    expect((failure as Error).message).not.toContain(ACCESS_TOKEN);
   });
 });

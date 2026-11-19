@@ -17,12 +17,27 @@ export interface WhatsAppClient {
 /** The Graph API refused a message, or could not be reached. Its message never holds the token or the recipient. */
 export class WhatsAppSendError extends Error {
   readonly status: number;
+  /** The `error.code` of the Graph answer when it carried one (for example 190, an invalid or expired token). */
+  readonly graphCode: number | undefined;
 
   constructor(status: number, graphCode?: number) {
     super(`WhatsApp send failed with status ${status}${graphCode === undefined ? "" : ` (Graph error code ${graphCode})`}`);
     this.name = "WhatsAppSendError";
     this.status = status;
+    this.graphCode = graphCode;
   }
+}
+
+/** Graph error code for an invalid, expired or revoked access token (`OAuthException`). */
+const GRAPH_INVALID_TOKEN_CODE = 190;
+
+/**
+ * True when Graph refused the credentials themselves (HTTP 401 or 403, or Graph error code 190, which can come
+ * with a 400): the same token fails for every message, so it is a systemic problem, not a problem of one row.
+ */
+export function isAuthSendError(error: unknown): boolean {
+  if (!(error instanceof WhatsAppSendError)) return false;
+  return error.status === 401 || error.status === 403 || error.graphCode === GRAPH_INVALID_TOKEN_CODE;
 }
 
 /**

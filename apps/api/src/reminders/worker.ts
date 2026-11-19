@@ -10,8 +10,12 @@ export const REMINDERS_SWEEP_CRON = "* * * * *";
 export interface ReminderWorkerOptions {
   /** Same Postgres as the app: pg-boss keeps its own tables in a separate schema. */
   connectionString: string;
-  /** One sweep. Must be safe to run concurrently (the sweep claims rows in the database). */
-  run: () => Promise<unknown>;
+  /**
+   * One sweep. Must be safe to run concurrently (the sweep claims rows in the database). `signal` is raised by
+   * `stop()`: the sweep should finish the row it is sending and claim no more. A returned summary (see
+   * `SweepCounts`) is logged when the sweep did any work.
+   */
+  run: (signal: AbortSignal) => Promise<unknown>;
   logger?: WhatsAppLogger;
   /** pg-boss schema; `pgboss` by default. Tests use a scratch one. */
   schema?: string;
@@ -19,10 +23,29 @@ export interface ReminderWorkerOptions {
   pollingIntervalSeconds?: number;
 }
 
+/** The counts of a sweep that the worker logs; `SweepSummary` has this shape. Anything else a run returns is ignored. */
+export interface SweepCounts {
+  claimed: number;
+  sent: number;
+  skipped: number;
+  failed: number;
+  retried: number;
+  deferred: number;
+  errored: number;
+  paused: boolean;
+}
+
+function isSweepCounts(value: unknown): value is SweepCounts {
+  if (typeof value !== "object" || value === null) return false;
+  const counts = value as Record<string, unknown>;
+  return ["claimed", "sent", "skipped", "failed", "retried", "deferred", "errored"].every((key) => typeof counts[key] === "number") &&
+    typeof counts.paused === "boolean";
+}
+
 export interface ReminderWorker {
   /** Installs/migrates the pg-boss schema, registers the worker and the every-minute schedule. Idempotent. */
   start: () => Promise<void>;
-  /** Stops polling, waits for a running sweep (up to 10 s) and closes pg-boss's connections. Idempotent. */
+  /** Raises the sweep's stop signal, stops polling, waits for the sweep in flight (up to 10 s) and closes pg-boss's connections. Idempotent. */
   stop: () => Promise<void>;
   /** Queues one sweep now instead of waiting for the next minute. Requires `start`. */
   runNow: () => Promise<void>;
@@ -34,11 +57,13 @@ const STOP_TIMEOUT_MS = 10_000;
 export function createReminderWorker(options: ReminderWorkerOptions): ReminderWorker {
   const logger = options.logger ?? consoleLogger;
   let boss: PgBoss | null = null;
+  let stopSignal: AbortController | null = null;
 
   return {
     async start() {
       if (boss) return;
 
+      const controller = new AbortController();
       const instance = new PgBoss({
         connectionString: options.connectionString,
         application_name: "gestion-reminders",
@@ -56,7 +81,20 @@ export function createReminderWorker(options: ReminderWorkerOptions): ReminderWo
           { pollingIntervalSeconds: options.pollingIntervalSeconds ?? 5 },
           async () => {
             try {
-              await options.run();
+              const summary = await options.run(controller.signal);
+              // Idle sweeps (every minute) stay silent; one that claimed rows says what became of them.
+              if (isSweepCounts(summary) && summary.claimed > 0) {
+                logger.info("reminders sweep", {
+                  claimed: summary.claimed,
+                  sent: summary.sent,
+                  skipped: summary.skipped,
+                  failed: summary.failed,
+                  retried: summary.retried,
+                  deferred: summary.deferred,
+                  errored: summary.errored,
+                  paused: summary.paused,
+                });
+              }
             } catch (error) {
               // pg-boss records the failed job; the next minute's sweep picks the same rows up.
               logger.error("reminders sweep failed", { reason: describeError(error) });
@@ -70,11 +108,16 @@ export function createReminderWorker(options: ReminderWorkerOptions): ReminderWo
         throw error;
       }
       boss = instance;
+      stopSignal = controller;
     },
 
     async stop() {
       const instance = boss;
+      const controller = stopSignal;
       boss = null;
+      stopSignal = null;
+      // Raised first: the sweep in flight finishes its current row and claims no other, then pg-boss waits for it.
+      controller?.abort();
       if (instance) await instance.stop({ graceful: true, close: true, timeout: STOP_TIMEOUT_MS });
     },
 

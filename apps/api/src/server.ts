@@ -184,7 +184,7 @@ function buildReminders(
     );
   const worker = createReminderWorker({
     connectionString: options.databaseUrl,
-    run: () => sweep(),
+    run: (signal) => sweep({ signal }),
     ...(logger ? { logger } : {}),
     ...reminders.worker,
   });

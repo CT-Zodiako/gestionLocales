@@ -499,26 +499,45 @@ buttons that need parameters is expected to be refused by Meta with a `4xx` (per
   sent again for the new time. A reminder already sent stays as it is.
 - **Sweep.** A pg-boss schedule `reminders-sweep` runs every minute (pg-boss keeps its own tables in the
   `pgboss` schema of the same database; the first start creates it, so the database user needs `CREATE` on the
-  database). A sweep claims due rows in one statement (`pending` -> `sending` with `claimed_at`, `FOR UPDATE SKIP
-  LOCKED`) **before** calling WhatsApp, so concurrent sweeps (several API instances, overlapping runs) never send the
-  same row. At send time it checks again that the appointment is still `booked` and in the future, the customer
-  has a phone and the business has a row in `whatsapp_channels` (otherwise the reminder is `skipped` with the
-  reason in `last_error`), then sends the template through the business's number.
+  database). A sweep works **one row at a time**: it claims one due row in one statement (`pending` -> `sending`
+  with `claimed_at`, `FOR UPDATE SKIP LOCKED`) **before** calling WhatsApp, sends it, records the result, and only
+  then claims the next. So at most one send is in flight per worker, the 5 minute lease only has to outlast one
+  send, and concurrent sweeps (several API instances, overlapping runs) do not take the same row. A sweep stops
+  when nothing is due, after 50 rows, after 4 minutes, or when the process is shutting down. At send time it
+  checks again that the appointment is still `booked` and in the future, the customer has a phone and the
+  business has a row in `whatsapp_channels` (otherwise the reminder is `skipped` with the reason in `last_error`),
+  then sends the template through the business's number.
 - **Retries.** Transient failures (network error, timeout, `5xx`, `408`, `429`, the same classification as the
   webhook) put the row back to `pending` with a backoff of 1, 5 and 30 minutes, up to 4 attempts in total, then
-  `failed`. Any other `4xx` (invalid token, rejected template, unknown number) is permanent: `failed` at once.
-  Nothing retries a `failed` row; fix the cause and, if you still want to send it, set its status back to
-  `pending` and `attempts` to `0` by hand.
-- **Crashes.** A row left `sending` for more than 5 minutes (the process died mid-send) is claimed again by the
-  next sweep, which counts as another attempt; a row that keeps dying is `failed` after the 4th. **Limit:** if the
-  process dies *after* WhatsApp accepted the message but *before* the row was marked `sent`, the message is sent
-  once more after the lease. Closing that gap would need an idempotency key that Meta honours; this implementation does not have one.
-  A worker whose lease was taken over cannot overwrite the new owner's result.
+  `failed`. Any other `4xx` (rejected template, unknown number) is permanent: `failed` at once. Nothing retries a
+  `failed` row; fix the cause and, if you still want to send it, set its status back to `pending` and `attempts`
+  to `0` by hand (SQL you write yourself; there is no command for it). Because the backoff adds up to about 36
+  minutes, a Graph outage longer than that still ends in `failed` for the rows that were tried during it.
+- **Invalid or expired token (`401`, `403`, or Graph error code `190`).** This is not a problem of one reminder,
+  so it never fails rows. The row that met it goes back to `pending` **without using up an attempt**, with a
+  short note in `last_error`, the sweep stops, one error line is logged (`WhatsApp authentication failed; pausing
+  reminders`), and this process sends nothing for **10 minutes**. After that one sweep is tried again: if it
+  succeeds the reminders go out (late, but the send-time checks above still apply: a cancelled or past
+  appointment is never reminded); if the token is still refused the pause starts over. So fix the token (and
+  restart the API if you changed the environment variable) and the waiting reminders go out by themselves. The
+  pause is in memory: each API process has its own.
+- **Duplicates.** The send is not idempotent (Meta gives no key to deduplicate with), so a reminder can reach a
+  customer twice. At most one send is in flight per worker, but a duplicate is possible after: a crash or
+  restart that happens after WhatsApp accepted the message but before the row was marked `sent` (the lease
+  expires and the row is sent again); a lost response (a timeout or `5xx` after Meta accepted the message is
+  treated as transient and retried); a graceful shutdown in the middle of a send (the process waits 10 seconds for
+  it, then closes the database); and a single send that takes longer than the 5 minute lease. The attempts are
+  capped at 4. A worker whose lease was taken over cannot overwrite the new owner's result.
+- **Crashes.** A row left `sending` for 5 minutes or more (the process died mid-send) is claimed again by the
+  next sweep, which counts as another attempt; a row that keeps dying is `failed` after the 4th.
 - **Logs** carry reminder and appointment ids, the kind, the attempt and an error kind; never phone numbers,
-  customer names or tokens.
+  customer names or tokens. A sweep that claimed rows also writes one summary line with the counts (`claimed`,
+  `sent`, `skipped`, `failed`, `retried`, `deferred`, `errored`, `paused`); an idle sweep writes nothing.
 
-Shutdown (`SIGTERM`/`SIGINT`) stops the worker gracefully (a running sweep gets 10 seconds) before the database
-connection closes. Tests call the exported `sweepReminders` directly with a fake client and an injected clock;
+Shutdown (`SIGTERM`/`SIGINT`) stops the worker gracefully: the running sweep finishes the row it is sending and
+claims no other (rows not yet claimed stay `pending` for the next start), waiting at most 10 seconds, before the
+database connection closes. If the send in flight cannot be recorded in time, its row stays `sending` and is
+taken again after the lease. Tests call the exported `sweepReminders` directly with a fake client and an injected clock;
 one integration test starts pg-boss against the test database in a scratch schema.
 
 ## Data model

@@ -6,13 +6,16 @@ import {
   createService,
   ensureBusiness,
   listRemindersForAppointment,
+  moveAppointment,
   removeBusinessWithAgenda,
+  sql,
   upsertCustomer,
 } from "@gestion/db";
 import { WhatsAppSendError } from "../src/whatsapp/client.ts";
+import { REMINDER_LEASE_MS, createReminderBreaker, sweepReminders } from "../src/reminders/sweep.ts";
 import { MINUTE, MONDAY_MORNING, TEMPLATES, createHarness, type Harness, type Tenant } from "./support/whatsapp-harness.ts";
 import { DAY, HOUR } from "./support/reminders.ts";
-import { templateParams } from "./support/whatsapp.ts";
+import { FakeWhatsAppClient, templateParams } from "./support/whatsapp.ts";
 
 const NOW = MONDAY_MORNING; // 2031-03-10T13:00:00Z
 const newPhone = () => `57300${randomInt(1_000_000, 9_999_999)}`;
@@ -35,6 +38,7 @@ describe("reminder sweep", () => {
     harness.clock.now = NOW;
     harness.client.templateErrors = [];
     harness.client.templateDelayMs = 0;
+    harness.client.beforeTemplate = undefined;
   });
 
   afterAll(async () => {
@@ -72,6 +76,20 @@ describe("reminder sweep", () => {
     if (!row) throw new Error(`no ${kind} reminder`);
     return row;
   };
+
+  /**
+   * `count` bookings whose confirmations fell due one minute apart (the first is the oldest), so a sweep claims
+   * them in booking order; the clock is back at NOW afterwards.
+   */
+  async function scheduleDue(tenant: Tenant, count: number) {
+    const booked = [];
+    for (let index = 0; index < count; index++) {
+      harness.clock.now = at(NOW, -(count - index) * MINUTE);
+      booked.push(await schedule(tenant, { startsAt: at(NOW, (3 + index) * DAY) }));
+    }
+    harness.clock.now = NOW;
+    return booked;
+  }
 
   describe("sending", () => {
     it("sends a due confirmation exactly once, with the template, language and four parameters", async () => {
@@ -189,17 +207,223 @@ describe("reminder sweep", () => {
       }
     });
 
-    it("sends every due reminder even when there are more than one batch", async () => {
+    it("sends at most `batchSize` rows per sweep, one at a time, and the next sweep continues with the rest", async () => {
       const tenant = await harness.newTenant();
       const phones: string[] = [];
       for (let index = 0; index < 5; index++) {
         phones.push((await schedule(tenant, { startsAt: at(NOW, (3 + index) * DAY) })).phone);
       }
 
-      const summary = await sweep(tenant, { batchSize: 2 });
+      const first = await sweep(tenant, { batchSize: 2 });
+
+      expect(first).toMatchObject({ claimed: 2, sent: 2, paused: false });
+      expect(phones.filter((phone) => harness.client.templatesTo(phone).length === 1)).toHaveLength(2);
+
+      const second = await sweep(tenant, { batchSize: 2 });
+      const third = await sweep(tenant, { batchSize: 2 });
+      const fourth = await sweep(tenant, { batchSize: 2 });
+
+      expect([second.claimed, third.claimed, fourth.claimed]).toEqual([2, 1, 0]);
+      for (const phone of phones) expect(harness.client.templatesTo(phone)).toHaveLength(1);
+    });
+
+    it("sends every due reminder in one sweep by default (up to 50 rows)", async () => {
+      const tenant = await harness.newTenant();
+      const phones: string[] = [];
+      for (let index = 0; index < 5; index++) {
+        phones.push((await schedule(tenant, { startsAt: at(NOW, (3 + index) * DAY) })).phone);
+      }
+
+      const summary = await sweep(tenant);
 
       expect(summary).toMatchObject({ claimed: 5, sent: 5 });
       for (const phone of phones) expect(harness.client.templatesTo(phone)).toHaveLength(1);
+    });
+  });
+
+  describe("one row at a time", () => {
+    it("claims only the row it is sending: the rows behind it stay pending, so a slow send cannot make them outlive the lease", async () => {
+      // Given - three due rows; the first send hangs inside Graph
+      const tenant = await harness.newTenant();
+      const booked = await scheduleDue(tenant, 3);
+      const held = harness.client.holdNextTemplate();
+
+      // When
+      const slow = sweep(tenant);
+      await held.started;
+
+      // Then - only the first row is claimed
+      const statuses = async () => Promise.all(booked.map(async (entry) => (await rowOf(entry.appointment.id, "confirmation")).status));
+      expect(await statuses()).toEqual(["sending", "pending", "pending"]);
+      held.release();
+      expect(await slow).toMatchObject({ claimed: 3, sent: 3 });
+    });
+
+    it("does not let a second instance retake the rows behind a slow send: each of them is sent exactly once", async () => {
+      // Given - three due rows; the first send of instance A hangs for longer than the lease
+      const tenant = await harness.newTenant();
+      const booked = await scheduleDue(tenant, 3);
+      const held = harness.client.holdNextTemplate();
+      const instanceA = sweep(tenant);
+      await held.started;
+
+      // When - instance B sweeps once the lease of A's in-flight row has expired, then A's slow send finally returns
+      harness.clock.now = at(NOW, REMINDER_LEASE_MS + MINUTE);
+      const instanceB = await sweep(tenant);
+      held.release();
+      await instanceA;
+
+      // Then - only the first row (the one whose send overran the lease) can be sent twice; the rows behind it once
+      expect(instanceB).toMatchObject({ claimed: 3, sent: 3 });
+      expect(harness.client.templatesTo(booked[0]?.phone ?? "").length).toBeLessThanOrEqual(2);
+      expect(harness.client.templatesTo(booked[1]?.phone ?? "")).toHaveLength(1);
+      expect(harness.client.templatesTo(booked[2]?.phone ?? "")).toHaveLength(1);
+      for (const entry of booked) expect((await rowOf(entry.appointment.id, "confirmation")).status).toBe("sent");
+    });
+
+    it("sends each reminder exactly once when two sweeps race while every send takes a minute of (injected) time", async () => {
+      // Given
+      const tenant = await harness.newTenant();
+      const phones: string[] = [];
+      for (let index = 0; index < 6; index++) {
+        phones.push((await schedule(tenant, { startsAt: at(NOW, (3 + index) * DAY) })).phone);
+      }
+      harness.client.templateDelayMs = 20;
+      harness.client.beforeTemplate = () => {
+        harness.clock.now = at(harness.clock.now, MINUTE);
+      };
+
+      // When - (a long budget: this test is about the lease, not about the budget)
+      const [a, b] = await Promise.all([sweep(tenant, { timeBudgetMs: 60 * MINUTE }), sweep(tenant, { timeBudgetMs: 60 * MINUTE })]);
+
+      // Then
+      for (const phone of phones) expect(harness.client.templatesTo(phone)).toHaveLength(1);
+      expect(a.sent + b.sent).toBe(6);
+      expect(a.claimed + b.claimed).toBe(6);
+    });
+
+    it.each([2, 3, 6])(
+      "sends each reminder exactly once across %i independent sweep instances (separate clients, 25 ms Graph) over 18 rows",
+      async (instances) => {
+        // Given - 18 due rows and N instances that share nothing but the database
+        const tenant = await harness.newTenant();
+        const booked = await scheduleDue(tenant, 18);
+        const clients = Array.from({ length: instances }, () => {
+          const client = new FakeWhatsAppClient();
+          client.templateDelayMs = 25;
+          return client;
+        });
+
+        // When
+        const summaries = await Promise.all(
+          clients.map((client) =>
+            sweepReminders(
+              { db: harness.server.db, client, templates: TEMPLATES, now: () => NOW },
+              { businessIds: [tenant.businessId] },
+            ),
+          ),
+        );
+
+        // Then
+        for (const entry of booked) {
+          const sends = clients.reduce((total, client) => total + client.templatesTo(entry.phone).length, 0);
+          expect(sends).toBe(1);
+        }
+        expect(summaries.reduce((total, summary) => total + summary.claimed, 0)).toBe(18);
+        expect(summaries.reduce((total, summary) => total + summary.sent, 0)).toBe(18);
+        const rows = await Promise.all(booked.map((entry) => rowOf(entry.appointment.id, "confirmation")));
+        expect(rows.every((row) => row.status === "sent" && row.attempts === 1)).toBe(true);
+      },
+    );
+
+    it("keeps a row that has been sending for 4:59.999 and retakes it at exactly 5:00 as attempt 2 (the documented duplicate)", async () => {
+      // Given - a send that hangs inside Graph since NOW
+      const tenant = await harness.newTenant();
+      const { appointment, phone } = await schedule(tenant, { startsAt: at(NOW, 3 * DAY) });
+      const held = harness.client.holdNextTemplate();
+      const stuck = sweep(tenant);
+      await held.started;
+      const calls = harness.client.templateCalls;
+
+      // When / Then - one millisecond short of the lease: untouched
+      harness.clock.now = at(NOW, REMINDER_LEASE_MS - 1);
+      expect(await sweep(tenant)).toMatchObject({ claimed: 0, sent: 0 });
+      expect(harness.client.templateCalls).toBe(calls);
+      expect(await rowOf(appointment.id, "confirmation")).toMatchObject({ status: "sending", attempts: 1 });
+
+      // When / Then - at the lease: retaken, counted as the second attempt
+      harness.clock.now = at(NOW, REMINDER_LEASE_MS);
+      expect(await sweep(tenant)).toMatchObject({ claimed: 1, sent: 1 });
+      expect(await rowOf(appointment.id, "confirmation")).toMatchObject({ status: "sent", attempts: 2 });
+      expect(harness.client.templatesTo(phone)).toHaveLength(1);
+
+      // and the slow first send, if it did reach Graph, is the duplicate: the row keeps the retaker's result
+      const winner = await rowOf(appointment.id, "confirmation");
+      held.release();
+      await stuck;
+      expect(harness.client.templatesTo(phone)).toHaveLength(2);
+      expect(await rowOf(appointment.id, "confirmation")).toMatchObject({ status: "sent", attempts: 2, whatsappMessageId: winner.whatsappMessageId });
+    });
+
+    it("stops after the 4 minute time budget (injected clock) and leaves the rest pending for the next sweep", async () => {
+      // Given - ten due rows and a Graph that takes 90 seconds per send
+      const tenant = await harness.newTenant();
+      const phones = (await scheduleDue(tenant, 10)).map((entry) => entry.phone);
+      harness.client.beforeTemplate = () => {
+        harness.clock.now = at(harness.clock.now, 90_000);
+      };
+
+      // When - elapsed time is 0, 1.5 and 3 minutes before each of the first three rows, 4.5 after the third
+      const first = await sweep(tenant);
+
+      // Then
+      expect(first).toMatchObject({ claimed: 3, sent: 3, paused: false });
+      expect(phones.filter((phone) => harness.client.templatesTo(phone).length === 1)).toHaveLength(3);
+
+      // and the next sweep carries on with the rest (three more within its own budget)
+      const second = await sweep(tenant);
+      expect(second).toMatchObject({ claimed: 3, sent: 3 });
+    });
+
+    it("honours a custom time budget", async () => {
+      const tenant = await harness.newTenant();
+      await scheduleDue(tenant, 4);
+      harness.client.beforeTemplate = () => {
+        harness.clock.now = at(harness.clock.now, MINUTE);
+      };
+
+      const summary = await sweep(tenant, { timeBudgetMs: 90_000 });
+
+      expect(summary).toMatchObject({ claimed: 2, sent: 2 });
+    });
+
+    it("stops between rows when the stop signal is raised: the row in flight finishes, the rest stay pending and unclaimed", async () => {
+      // Given
+      const tenant = await harness.newTenant();
+      const booked = await scheduleDue(tenant, 3);
+      const stop = new AbortController();
+
+      // When - the signal is raised while the first row is being processed
+      const summary = await sweep(tenant, { signal: stop.signal, afterClaim: () => stop.abort() });
+
+      // Then
+      expect(summary).toMatchObject({ claimed: 1, sent: 1 });
+      expect(harness.client.templatesTo(booked[0]?.phone ?? "")).toHaveLength(1);
+      const rows = await Promise.all(booked.map((entry) => rowOf(entry.appointment.id, "confirmation")));
+      expect(rows.map((row) => [row.status, row.attempts])).toEqual([["sent", 1], ["pending", 0], ["pending", 0]]);
+    });
+
+    it("claims nothing when the signal was already raised", async () => {
+      const tenant = await harness.newTenant();
+      const { appointment, phone } = await schedule(tenant, { startsAt: at(NOW, 3 * DAY) });
+      const calls = harness.client.templateCalls;
+
+      const summary = await sweep(tenant, { signal: AbortSignal.abort() });
+
+      expect(summary).toMatchObject({ claimed: 0, sent: 0 });
+      expect(harness.client.templateCalls).toBe(calls);
+      expect(harness.client.templatesTo(phone)).toEqual([]);
+      expect(await rowOf(appointment.id, "confirmation")).toMatchObject({ status: "pending", attempts: 0 });
     });
   });
 
@@ -373,7 +597,7 @@ describe("reminder sweep", () => {
       expect(await rowOf(appointment.id, "confirmation")).toMatchObject({ status: "sent", attempts: 2, lastError: null });
     });
 
-    it.each([400, 401, 403, 404])("fails at once after a permanent %i and never retries", async (status) => {
+    it.each([400, 404])("fails at once after a permanent %i and never retries", async (status) => {
       const tenant = await harness.newTenant();
       const { appointment, phone } = await schedule(tenant, { startsAt: at(NOW, 3 * DAY) });
       harness.client.templateErrors = [new WhatsAppSendError(status)];
@@ -404,6 +628,261 @@ describe("reminder sweep", () => {
         (await rowOf(second.appointment.id, "confirmation")).status,
       ].sort();
       expect(statuses).toEqual(["failed", "sent"]);
+    });
+  });
+
+  describe("authentication errors (circuit breaker)", () => {
+    const AUTH_ERROR_MESSAGE = "WhatsApp authentication failed; pausing reminders";
+    const authErrors: Array<[string, () => Error]> = [
+      ["HTTP 401", () => new WhatsAppSendError(401)],
+      ["HTTP 403", () => new WhatsAppSendError(403)],
+      ["Graph error code 190 (with a 400)", () => new WhatsAppSendError(400, 190)],
+    ];
+
+    async function threeDue(tenant: Tenant) {
+      const booked = await scheduleDue(tenant, 3);
+      return booked;
+    }
+
+    it.each(authErrors)(
+      "after %s the row goes back to pending without losing an attempt, the sweep stops and the rows behind are not touched",
+      async (_name, makeError) => {
+        // Given
+        const tenant = await harness.newTenant();
+        const booked = await threeDue(tenant);
+        harness.client.templateErrors = [makeError()];
+        const calls = harness.client.templateCalls;
+        const logsBefore = harness.logs.length;
+
+        // When
+        const summary = await sweep(tenant, { breaker: createReminderBreaker() });
+
+        // Then
+        expect(summary).toMatchObject({ claimed: 1, sent: 0, failed: 0, retried: 0, deferred: 1, paused: true });
+        expect(harness.client.templateCalls - calls).toBe(1);
+        const rows = await Promise.all(booked.map((entry) => rowOf(entry.appointment.id, "confirmation")));
+        expect(rows.map((row) => [row.status, row.attempts])).toEqual([["pending", 0], ["pending", 0], ["pending", 0]]);
+        expect(rows[0]?.lastError).toEqual(expect.any(String));
+        expect(rows[0]?.lastError).toMatch(/authentication|40[13]|190/i);
+        expect(rows[0]?.dueAt.toISOString()).toBe(at(NOW, -3 * MINUTE).toISOString());
+
+        const errorLines = harness.logs.slice(logsBefore).filter((line) => line.startsWith("error "));
+        expect(errorLines).toHaveLength(1);
+        expect(errorLines[0]).toContain(AUTH_ERROR_MESSAGE);
+        const recorded = [...harness.logs.slice(logsBefore), ...rows.map((row) => row.lastError ?? "")].join("\n");
+        for (const entry of booked) expect(recorded).not.toContain(entry.phone);
+        expect(recorded).not.toMatch(/5730\d{3}/);
+      },
+    );
+
+    it("pauses for 10 minutes: no claim and no send while paused, then one sweep is tried and a success sends everything", async () => {
+      // Given - the breaker is open since NOW
+      const tenant = await harness.newTenant();
+      const booked = await threeDue(tenant);
+      const breaker = createReminderBreaker();
+      harness.client.templateErrors = [new WhatsAppSendError(401)];
+      await sweep(tenant, { breaker });
+      const calls = harness.client.templateCalls;
+
+      // When - just before the pause ends
+      harness.clock.now = at(NOW, 10 * MINUTE - 1);
+      const paused = await sweep(tenant, { breaker });
+
+      // Then
+      expect(paused).toMatchObject({ claimed: 0, sent: 0, paused: true });
+      expect(harness.client.templateCalls).toBe(calls);
+      const rows = await Promise.all(booked.map((entry) => rowOf(entry.appointment.id, "confirmation")));
+      expect(rows.map((row) => [row.status, row.attempts])).toEqual([["pending", 0], ["pending", 0], ["pending", 0]]);
+
+      // When - the pause is over and the token works again
+      harness.clock.now = at(NOW, 10 * MINUTE);
+      const resumed = await sweep(tenant, { breaker });
+
+      // Then - the overdue rows go out, the first one on its first counted attempt
+      expect(resumed).toMatchObject({ claimed: 3, sent: 3, deferred: 0, paused: false });
+      for (const entry of booked) expect(harness.client.templatesTo(entry.phone)).toHaveLength(1);
+      expect((await rowOf(booked[0]?.appointment.id ?? "", "confirmation")).attempts).toBe(1);
+
+      // and the breaker is closed: a later sweep is not paused
+      harness.clock.now = at(NOW, 11 * MINUTE);
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 0, paused: false });
+    });
+
+    it("opens again for another 10 minutes when the single sweep tried after the pause still gets an authentication error", async () => {
+      const tenant = await harness.newTenant();
+      const booked = await threeDue(tenant);
+      const breaker = createReminderBreaker();
+      harness.client.templateErrors = [new WhatsAppSendError(403), new WhatsAppSendError(403)];
+      await sweep(tenant, { breaker });
+
+      harness.clock.now = at(NOW, 10 * MINUTE);
+      const retry = await sweep(tenant, { breaker });
+      harness.clock.now = at(NOW, 19 * MINUTE);
+      const stillPaused = await sweep(tenant, { breaker });
+      harness.clock.now = at(NOW, 20 * MINUTE);
+      const recovered = await sweep(tenant, { breaker });
+
+      expect(retry).toMatchObject({ claimed: 1, deferred: 1, paused: true });
+      expect(stillPaused).toMatchObject({ claimed: 0, paused: true });
+      expect(recovered).toMatchObject({ claimed: 3, sent: 3, paused: false });
+      expect((await rowOf(booked[0]?.appointment.id ?? "", "confirmation")).attempts).toBe(1);
+    });
+
+    it("does not pause on other 4xx (rejected per row) or on transient errors", async () => {
+      const tenant = await harness.newTenant();
+      const booked = await threeDue(tenant);
+      const breaker = createReminderBreaker();
+      harness.client.templateErrors = [new WhatsAppSendError(400, 132001), new WhatsAppSendError(503)];
+
+      const summary = await sweep(tenant, { breaker });
+
+      expect(summary).toMatchObject({ claimed: 3, failed: 1, retried: 1, sent: 1, deferred: 0, paused: false });
+      const statuses = await Promise.all(booked.map(async (entry) => (await rowOf(entry.appointment.id, "confirmation")).status));
+      expect(statuses).toEqual(["failed", "pending", "sent"]);
+    });
+
+    it("a send that succeeds while another sweep opens the breaker does not close it: both sweeps stop and nothing more is sent", async () => {
+      // Given - three due rows and one shared breaker. Sweep A's first send hangs inside Graph; sweep B's send is refused.
+      const tenant = await harness.newTenant();
+      const booked = await scheduleDue(tenant, 3);
+      const breaker = createReminderBreaker();
+      const held = harness.client.holdNextTemplate();
+      const sweepA = sweep(tenant, { breaker });
+      await held.started;
+      harness.client.templateErrors = [new WhatsAppSendError(401)];
+      const summaryB = await sweep(tenant, { breaker });
+      expect(summaryB).toMatchObject({ claimed: 1, deferred: 1, paused: true });
+
+      // When - A's slow send finally succeeds
+      held.release();
+      const summaryA = await sweepA;
+
+      // Then - A records its send but must not resume: B's authentication error still stands
+      expect(summaryA).toMatchObject({ claimed: 1, sent: 1, paused: true });
+      const rows = await Promise.all(booked.map((entry) => rowOf(entry.appointment.id, "confirmation")));
+      expect(rows.map((row) => [row.status, row.attempts])).toEqual([["sent", 1], ["pending", 0], ["pending", 0]]);
+      const calls = harness.client.templateCalls;
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 0, paused: true });
+      expect(harness.client.templateCalls).toBe(calls);
+    });
+
+    it("keeps skipping what became unsendable during a pause: after it only the untouched rows are sent", async () => {
+      // Given - six due rows; the first send is refused, which opens the breaker at NOW
+      const tenant = await harness.newTenant();
+      const booked = await scheduleDue(tenant, 6);
+      const [untouched, rawCancelled, rawMoved, cancelled, moved, alsoUntouched] = booked.map((entry) => entry.appointment);
+      const breaker = createReminderBreaker();
+      harness.client.templateErrors = [new WhatsAppSendError(401)];
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 1, deferred: 1, paused: true });
+
+      // When - during the pause: a cancel and a move to the past written straight to the table (nothing re-times the
+      // reminders), and the same two through the data layer the API uses
+      const db = harness.server.db;
+      const past = (offset: number) => at(NOW, offset).toISOString();
+      await db.execute(sql`update appointments set status = 'cancelled' where id = ${must(rawCancelled).id}`);
+      await db.execute(
+        sql`update appointments set starts_at = ${past(-2 * HOUR)}::timestamptz, ends_at = ${past(-2 * HOUR + 30 * MINUTE)}::timestamptz where id = ${must(rawMoved).id}`,
+      );
+      await cancelAppointment(db, tenant.businessId, must(cancelled).id);
+      await moveAppointment(db, tenant.businessId, must(moved).id, at(NOW, -HOUR), at(NOW, -HOUR + 30 * MINUTE), { now: () => harness.clock.now });
+      harness.clock.now = at(NOW, 10 * MINUTE);
+      const calls = harness.client.templateCalls;
+      const summary = await sweep(tenant, { breaker });
+
+      // Then - R0 and R5 go out; the others are skipped at send time (or already skipped by the data layer) without a Graph call
+      expect(summary).toMatchObject({ claimed: 5, sent: 2, skipped: 3, failed: 0, paused: false });
+      expect(harness.client.templateCalls - calls).toBe(2);
+      for (const sent of [untouched, alsoUntouched]) {
+        expect(harness.client.templatesTo(booked[booked.findIndex((entry) => entry.appointment.id === must(sent).id)]?.phone ?? "")).toHaveLength(1);
+      }
+      for (const entry of booked) {
+        const row = await rowOf(entry.appointment.id, "confirmation");
+        const expected = [untouched, alsoUntouched].some((kept) => kept?.id === entry.appointment.id) ? "sent" : "skipped";
+        expect(row.status).toBe(expected);
+        if (expected === "skipped") expect(harness.client.templatesTo(entry.phone)).toEqual([]);
+      }
+      expect((await rowOf(must(rawCancelled).id, "confirmation")).lastError).toMatch(/cancelled/i);
+      expect((await rowOf(must(rawMoved).id, "confirmation")).lastError).toMatch(/past/i);
+      expect((await rowOf(must(cancelled).id, "confirmation")).lastError).toMatch(/cancelled/i);
+      expect((await rowOf(must(moved).id, "confirmation")).lastError).toMatch(/past/i);
+      expect((await rowOf(must(untouched).id, "confirmation")).attempts).toBe(1);
+    });
+
+    it("counts attempts across a retry, a refused token, a second refusal after the pause and the final send", async () => {
+      // Given - one due row
+      const tenant = await harness.newTenant();
+      const { appointment, phone } = await schedule(tenant, { startsAt: at(NOW, 3 * DAY) });
+      const breaker = createReminderBreaker();
+      const state = async () => {
+        const row = await rowOf(appointment.id, "confirmation");
+        return { status: row.status, attempts: row.attempts, dueAt: row.dueAt.toISOString() };
+      };
+      harness.client.templateErrors = [new WhatsAppSendError(503), new WhatsAppSendError(401), new WhatsAppSendError(403)];
+      const before = harness.client.templateCalls;
+      const calls = () => harness.client.templateCalls - before;
+
+      // 1. a 503: a transient failure uses the attempt and backs off one minute
+      expect(await sweep(tenant, { breaker })).toMatchObject({ retried: 1, paused: false });
+      expect(await state()).toEqual({ status: "pending", attempts: 1, dueAt: at(NOW, MINUTE).toISOString() });
+
+      // 2. a 401: the attempt is refunded (still 1), the row stays due, the breaker opens
+      harness.clock.now = at(NOW, MINUTE);
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 1, deferred: 1, paused: true });
+      expect(await state()).toEqual({ status: "pending", attempts: 1, dueAt: at(NOW, MINUTE).toISOString() });
+
+      // 3. paused: nothing is claimed or sent
+      harness.clock.now = at(NOW, 11 * MINUTE - 1);
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 0, paused: true });
+      expect(calls()).toBe(2);
+
+      // 4. after the pause a 403: still attempt 1, paused for another 10 minutes
+      harness.clock.now = at(NOW, 11 * MINUTE);
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 1, deferred: 1, paused: true });
+      expect(await state()).toEqual({ status: "pending", attempts: 1, dueAt: at(NOW, MINUTE).toISOString() });
+      harness.clock.now = at(NOW, 21 * MINUTE - 1);
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 0, paused: true });
+      expect(calls()).toBe(3);
+
+      // 5. the pause is over and Graph accepts: sent, on the second attempt in total
+      harness.clock.now = at(NOW, 21 * MINUTE);
+      expect(await sweep(tenant, { breaker })).toMatchObject({ claimed: 1, sent: 1, paused: false });
+      expect((await state()).status).toBe("sent");
+      expect((await state()).attempts).toBe(2);
+      expect(calls()).toBe(4);
+      expect(harness.client.templatesTo(phone)).toHaveLength(1);
+    });
+
+    it("keeps one breaker per WhatsApp client when none is passed (the worker never passes one)", async () => {
+      // Given - a harness of its own, so its client has not seen any other test's breaker
+      const own = await createHarness({ reminders: true });
+      try {
+        const tenant = await own.newTenant();
+        const first = await (async () => {
+          const customer = await upsertCustomer(own.server.db, { businessId: tenant.businessId, phone: newPhone(), name: null });
+          return createAppointment(
+            own.server.db,
+            { businessId: tenant.businessId, customerId: customer.id, serviceId: tenant.serviceIds[0] ?? "", startsAt: at(NOW, 3 * DAY), endsAt: at(NOW, 3 * DAY + 30 * MINUTE) },
+            { scheduleReminders: true, now: () => own.clock.now },
+          );
+        })();
+        own.client.templateErrors = [new WhatsAppSendError(401)];
+
+        // When
+        const tripped = await own.sweep({ businessIds: [tenant.businessId] });
+        const calls = own.client.templateCalls;
+        const paused = await own.sweep({ businessIds: [tenant.businessId] });
+
+        // Then
+        expect(tripped).toMatchObject({ claimed: 1, deferred: 1, paused: true });
+        expect(paused).toMatchObject({ claimed: 0, paused: true });
+        expect(own.client.templateCalls).toBe(calls);
+        expect((await listRemindersForAppointment(own.server.db, first.id)).map((row) => [row.kind, row.status, row.attempts])).toEqual([
+          ["confirmation", "pending", 0],
+          ["reminder_24h", "pending", 0],
+        ]);
+      } finally {
+        await own.close();
+      }
     });
   });
 
@@ -547,9 +1026,11 @@ describe("reminder sweep", () => {
       // Then
       const rows = [...(await rowsOf(transient.appointment.id)), ...(await rowsOf(permanent.appointment.id))];
       const recorded = [...rows.map((row) => row.lastError ?? ""), ...harness.logs.slice(logsBefore)].join("\n");
-      for (const secret of [phone, "573008887766", "8877", token, "Ana", "Beto", "Reservad"]) {
+      for (const secret of [phone, "573008887766", "***8877", token, "Ana", "Beto", "Reservad"]) {
         expect(recorded).not.toContain(secret);
       }
+      // A bare last-four leak (not just the masked form) must fail too; the lookarounds keep the hex of random UUIDs out of the way.
+      expect(recorded).not.toMatch(/(?<![0-9a-f-])(8877|7766)(?![0-9a-f-])/);
     });
 
     it("logs a successful send without the recipient or the customer name", async () => {

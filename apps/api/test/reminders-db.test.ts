@@ -7,6 +7,7 @@ import {
   createAppointment,
   createDb,
   createService,
+  deferReminder,
   ensureBusiness,
   listRemindersForAppointment,
   listRemindersForBusiness,
@@ -224,6 +225,53 @@ describe("appointment_reminders data layer", () => {
       expect(scoped).toEqual([]);
       expect(empty).toEqual([]);
       expect((await listRemindersForBusiness(db, theirs.businessId)).map((row) => row.status)).toEqual(["pending", "pending"]);
+    });
+  });
+
+  describe("deferReminder", () => {
+    const lease = 5 * MINUTE;
+
+    it("puts a claimed reminder back to pending with its attempt refunded, keeping it due, and the next claim counts attempt 1", async () => {
+      const business = await newBusiness();
+      const appointment = await book(business, new Date(NOW.getTime() + 3 * DAY), { scheduleReminders: true, now: () => NOW });
+      const [claim] = await claimDueReminders(db, { now: NOW, leaseMs: lease, limit: 1, businessIds: [business.businessId] });
+      expect(claim?.attempts).toBe(1);
+
+      const deferred = await deferReminder(db, claim as NonNullable<typeof claim>, "Authentication failed (HTTP 401)");
+
+      expect(deferred).toBe(true);
+      const [row] = await listRemindersForAppointment(db, appointment.id);
+      expect(row).toMatchObject({ status: "pending", attempts: 0, claimedAt: null, lastError: "Authentication failed (HTTP 401)" });
+      expect(row?.dueAt.toISOString()).toBe(NOW.toISOString());
+      const [again] = await claimDueReminders(db, { now: NOW, leaseMs: lease, limit: 1, businessIds: [business.businessId] });
+      expect(again?.attempts).toBe(1);
+    });
+
+    it("refunds only the attempt of the claim: attempts from earlier claims stay counted", async () => {
+      const business = await newBusiness();
+      const appointment = await book(business, new Date(NOW.getTime() + 3 * DAY), { scheduleReminders: true, now: () => NOW });
+      await claimDueReminders(db, { now: NOW, leaseMs: lease, limit: 1, businessIds: [business.businessId] }); // a worker that died
+      const later = new Date(NOW.getTime() + 6 * MINUTE);
+      const [claim] = await claimDueReminders(db, { now: later, leaseMs: lease, limit: 1, businessIds: [business.businessId] });
+      expect(claim?.attempts).toBe(2);
+
+      await deferReminder(db, claim as NonNullable<typeof claim>, "note");
+
+      expect((await listRemindersForAppointment(db, appointment.id))[0]).toMatchObject({ status: "pending", attempts: 1 });
+    });
+
+    it("does nothing for a claim that was taken over (stale token) or already settled, and says so", async () => {
+      const business = await newBusiness();
+      const appointment = await book(business, new Date(NOW.getTime() + 3 * DAY), { scheduleReminders: true, now: () => NOW });
+      const [stale] = await claimDueReminders(db, { now: NOW, leaseMs: lease, limit: 1, businessIds: [business.businessId] });
+      const [owner] = await claimDueReminders(db, { now: new Date(NOW.getTime() + 6 * MINUTE), leaseMs: lease, limit: 1, businessIds: [business.businessId] });
+
+      const lateDefer = await deferReminder(db, stale as NonNullable<typeof stale>, "stale");
+
+      expect(lateDefer).toBe(false);
+      expect((await listRemindersForAppointment(db, appointment.id))[0]).toMatchObject({ status: "sending", attempts: 2, lastError: null });
+      expect(await deferReminder(db, owner as NonNullable<typeof owner>, "mine")).toBe(true);
+      expect(await deferReminder(db, owner as NonNullable<typeof owner>, "twice")).toBe(false);
     });
   });
 });

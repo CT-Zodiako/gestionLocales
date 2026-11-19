@@ -289,3 +289,29 @@ export async function settleReminder(
     .returning({ id: appointmentReminders.id });
   return rows.length > 0;
 }
+
+/**
+ * Puts a claimed reminder back to `pending` without consuming its attempt (the claim's increment is refunded) and
+ * keeps it due, noting why in `last_error`. For failures that say nothing about this row, such as a rejected
+ * access token: the sweep pauses and the row is sent once the cause is fixed, still on its first attempt.
+ * Guarded by the claim exactly like `settleReminder`; returns whether the row was changed.
+ */
+export async function deferReminder(db: Database, claim: Pick<ClaimedReminder, "id" | "claimedAt">, note: string): Promise<boolean> {
+  const rows = await db
+    .update(appointmentReminders)
+    .set({
+      status: REMINDER_STATUS.PENDING,
+      attempts: sql`greatest(${appointmentReminders.attempts} - 1, 0)`,
+      lastError: note,
+      claimedAt: null,
+    })
+    .where(
+      and(
+        eq(appointmentReminders.id, claim.id),
+        eq(appointmentReminders.status, REMINDER_STATUS.SENDING),
+        eq(appointmentReminders.claimedAt, claim.claimedAt),
+      ),
+    )
+    .returning({ id: appointmentReminders.id });
+  return rows.length > 0;
+}

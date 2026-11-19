@@ -131,6 +131,8 @@ export class FakeWhatsAppClient implements WhatsAppClient {
   templateCalls = 0;
   /** Pause inside every `sendTemplate` call, to widen race windows. */
   templateDelayMs = 0;
+  /** Runs at the start of every `sendTemplate` call, before any hold or delay (tests move the injected clock here to simulate a slow Graph). */
+  beforeTemplate: (() => void | Promise<void>) | undefined;
   private holds: Array<{ gate: Promise<void>; onStart: () => void }> = [];
 
   /** The next `sendTemplate` call blocks until the returned handle is released. */
@@ -149,6 +151,7 @@ export class FakeWhatsAppClient implements WhatsAppClient {
 
   async sendTemplate(input: SentTemplate): Promise<{ messageId: string | null }> {
     this.templateCalls += 1;
+    await this.beforeTemplate?.();
     const hold = this.holds.shift();
     if (hold) {
       hold.onStart();
