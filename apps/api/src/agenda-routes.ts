@@ -12,6 +12,7 @@ import type {
   listServices,
   moveAppointment,
   setOpeningHours,
+  updateService,
   upsertCustomer,
 } from "@gestion/db";
 import {
@@ -22,6 +23,8 @@ import {
   listAppointmentsQuerySchema,
   moveAppointmentBodySchema,
   openingHoursSchema,
+  serviceIdParamSchema,
+  updateServiceBodySchema,
   type AppointmentDetailResponse,
   type AppointmentResponse,
   type ErrorResponse,
@@ -47,6 +50,7 @@ export type AgendaDeps = {
   cancelAppointment: Bound<typeof cancelAppointment>;
   listServices: Bound<typeof listServices>;
   createService: Bound<typeof createService>;
+  updateService: Bound<typeof updateService>;
   listOpeningHours: Bound<typeof listOpeningHours>;
   setOpeningHours: Bound<typeof setOpeningHours>;
 };
@@ -102,7 +106,7 @@ function toAppointment(row: AppointmentFields): AppointmentResponse {
 }
 
 function toService(row: schema.Service): ServiceResponse {
-  return { id: row.id, name: row.name, durationMinutes: row.durationMinutes, active: row.active };
+  return { id: row.id, name: row.name, durationMinutes: row.durationMinutes, active: row.active, price: row.price };
 }
 
 /** `time` columns come back as `HH:MM:SS`; the API speaks `HH:MM`. */
@@ -243,6 +247,17 @@ function createServiceRoutes(deps: AgendaRoutesDeps, requireSession: SessionGuar
 
     const created = await agenda.createService({ businessId: c.var.businessId, ...body.data });
     return c.json(toService(created) satisfies ServiceResponse, 201);
+  });
+
+  routes.patch("/:id", async (c) => {
+    const params = parse(serviceIdParamSchema, c.req.param());
+    const body = parse(updateServiceBodySchema, await readJson(c));
+    if (!params.ok || !body.ok) return c.json(invalidRequest, 400);
+
+    // The business comes from the session: another business's service is simply not found.
+    const updated = await agenda.updateService(c.var.businessId, params.data.id, body.data);
+    if (!updated) return c.json(notFound, 404);
+    return c.json(toService(updated) satisfies ServiceResponse, 200);
   });
 
   return routes;

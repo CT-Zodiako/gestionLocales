@@ -3,11 +3,14 @@ import { Hono } from "hono";
 import {
   cancelUpcomingAppointmentForPhone,
   claimWhatsappMessage,
+  clearPendingName,
+  completePendingName,
   completeWhatsappMessage,
   createAppointment,
   createService,
   ensureBusiness,
   findBookedAppointmentForPhoneAt,
+  findCustomerByPhone,
   findService,
   findUpcomingAppointmentForPhone,
   findWhatsappChannel,
@@ -18,10 +21,13 @@ import {
   listOpeningHours,
   listServices,
   listUpcomingAppointmentsForPhone,
+  rejectPendingName,
   releaseWhatsappMessage,
   removeBusinessWithAgenda,
   setBusinessTimezone,
   setOpeningHours,
+  sql,
+  startPendingName,
   upsertCustomer,
   type AppointmentDetail,
   type Database,
@@ -105,8 +111,8 @@ export interface TenantOptions {
   timezone?: string;
   /** Opening ranges to store; defaults to Monday to Friday 09:00-11:00. `null` stores none. */
   hours?: Array<{ weekday: number; opensAt: string; closesAt: string }> | null;
-  /** Services to create (name, minutes); defaults to one "Corte" of 30 minutes. `[]` creates none. */
-  services?: Array<{ name: string; durationMinutes: number; active?: boolean }>;
+  /** Services to create (name, minutes, optional whole-peso price); defaults to one "Corte" of 30 minutes. `[]` creates none. */
+  services?: Array<{ name: string; durationMinutes: number; active?: boolean; price?: number | null }>;
 }
 
 export interface Tenant {
@@ -117,6 +123,12 @@ export interface Tenant {
   /** A customer sending messages to this business. */
   customer: (phone: string) => Customer;
   appointments: () => Promise<AppointmentDetail[]>;
+  /** A customer that already has this name stored (never asked for it by the bot). */
+  namedCustomer: (phone: string, name: string) => Promise<Customer>;
+  /** The stored name of the customer with that phone: `undefined` when there is no such customer row, `null` without a name. */
+  customerName: (phone: string) => Promise<string | null | undefined>;
+  /** The pending-name rows of that phone in this business (any age), read straight from the table. */
+  pendingNames: (phone: string) => Promise<Array<{ attempts: number; expiresAt: Date }>>;
   /** Books directly through the data layer, as "someone else" or the owner did. */
   bookDirect: (serviceId: string, phone: string, startsAt: Date, minutes: number) => Promise<schema.Appointment>;
 }
@@ -164,6 +176,11 @@ function controlledStore(db: Database, controls: Controls): WhatsAppStore {
     listOpeningHours: (businessId) => listOpeningHours(db, businessId),
     listAppointments: (input) => listAppointments(db, input),
     upsertCustomer: (input) => upsertCustomer(db, input),
+    findCustomerByPhone: (businessId, phone) => findCustomerByPhone(db, businessId, phone),
+    startPendingName: (input) => startPendingName(db, input),
+    clearPendingName: (input) => clearPendingName(db, input),
+    completePendingName: (input) => completePendingName(db, input),
+    rejectPendingName: (input) => rejectPendingName(db, input),
     createAppointment: (input) => createAppointment(db, input),
     findBookedAppointmentForPhoneAt: (input) => findBookedAppointmentForPhoneAt(db, input),
     listUpcomingAppointmentsForPhone: (input) => listUpcomingAppointmentsForPhone(db, input),
@@ -284,6 +301,22 @@ async function createTenant(harness: Harness, options: TenantOptions = {}): Prom
     serviceIds,
     harness,
     customer,
+    namedCustomer: async (phone, name) => {
+      await upsertCustomer(server.db, { businessId: business.id, phone, name });
+      return customer(phone);
+    },
+    customerName: async (phone) => {
+      const rows = await server.db.execute<{ name: string | null }>(
+        sql`select name from customers where business_id = ${business.id} and phone = ${phone}`,
+      );
+      return rows[0] === undefined ? undefined : rows[0].name;
+    },
+    pendingNames: async (phone) => {
+      const rows = await server.db.execute<{ attempts: number; expires_ms: number }>(
+        sql`select attempts, (extract(epoch from expires_at) * 1000)::float8 as expires_ms from whatsapp_pending_names where business_id = ${business.id} and phone = ${phone}`,
+      );
+      return rows.map((row) => ({ attempts: row.attempts, expiresAt: new Date(Math.round(Number(row.expires_ms))) }));
+    },
     appointments: () =>
       listAppointmentDetails(server.db, {
         businessId: business.id,
@@ -320,6 +353,12 @@ export function titlesOf(message: OutgoingMessage): string[] {
   if (message.type === "text") return [];
   if (message.interactive.type === "button") return message.interactive.action.buttons.map((button) => button.reply.title);
   return message.interactive.action.sections.flatMap((section) => section.rows.map((row) => row.title));
+}
+
+/** Row descriptions of a list message, in order (`undefined` for a row without one); empty for other messages. */
+export function descriptionsOf(message: OutgoingMessage): Array<string | undefined> {
+  if (message.type === "text" || message.interactive.type !== "list") return [];
+  return message.interactive.action.sections.flatMap((section) => section.rows.map((row) => row.description));
 }
 
 /** The id of the first reply whose id starts with `prefix`; throws when there is none. */

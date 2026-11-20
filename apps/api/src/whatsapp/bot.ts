@@ -1,17 +1,22 @@
 import { SlotTakenError } from "@gestion/db";
 import type {
   cancelUpcomingAppointmentForPhone,
+  clearPendingName,
+  completePendingName,
   createAppointment,
   findBookedAppointmentForPhoneAt,
+  findCustomerByPhone,
   findService,
   findUpcomingAppointmentForPhone,
   listAppointments,
   listOpeningHours,
   listServices,
   listUpcomingAppointmentsForPhone,
+  rejectPendingName,
+  startPendingName,
   upsertCustomer,
 } from "@gestion/db";
-import { INCOMING_KIND, type IncomingContent } from "@gestion/shared";
+import { INCOMING_KIND, parseCustomerName, type IncomingContent } from "@gestion/shared";
 import {
   addDays,
   computeDaySlots,
@@ -26,6 +31,7 @@ import {
 import {
   buttonsMessage,
   listMessage,
+  textMessage,
   truncate,
   WHATSAPP_LIMITS,
   type ListRowInput,
@@ -42,6 +48,12 @@ export interface BotStore {
   listOpeningHours: Bound<typeof listOpeningHours>;
   listAppointments: Bound<typeof listAppointments>;
   upsertCustomer: Bound<typeof upsertCustomer>;
+  findCustomerByPhone: Bound<typeof findCustomerByPhone>;
+  /** The name question: opened by Agendar for a sender without a name, consumed by their next free text. */
+  startPendingName: Bound<typeof startPendingName>;
+  clearPendingName: Bound<typeof clearPendingName>;
+  completePendingName: Bound<typeof completePendingName>;
+  rejectPendingName: Bound<typeof rejectPendingName>;
   createAppointment: Bound<typeof createAppointment>;
   findBookedAppointmentForPhoneAt: Bound<typeof findBookedAppointmentForPhoneAt>;
   listUpcomingAppointmentsForPhone: Bound<typeof listUpcomingAppointmentsForPhone>;
@@ -121,7 +133,20 @@ const COPY = {
   nothingToCancel: "No tienes citas para cancelar.",
   appointmentGone: "Esa cita ya no está disponible para cancelar.",
   cancelled: "Listo, tu cita fue cancelada ✅",
+  askName: "¿Cómo te llamas? Escribe tu nombre para continuar.",
+  nameHint: "No pude leer tu nombre. Escríbelo con letras, entre 2 y 60 caracteres (por ejemplo: María Pérez).\n\n¿Cómo te llamas?",
+  nameGaveUp: "No pude guardar tu nombre. Puedes intentarlo de nuevo al tocar Agendar.",
 } as const;
+
+/** `$25.000`: whole pesos with a dot as thousands separator (es-CO), no decimals. */
+export function formatPrice(price: number): string {
+  return `$${String(price).replace(/\B(?=(\d{3})+(?!\d))/g, ".")}`;
+}
+
+/** `30 min · $25.000`, or `30 min` when the service has no price. */
+function serviceFacts(durationMinutes: number, price: number | null): string {
+  return price === null ? `${durationMinutes} min` : `${durationMinutes} min · ${formatPrice(price)}`;
+}
 
 /** `lun 10 mar` */
 export function formatDay(date: string): string {
@@ -212,20 +237,72 @@ function pageOf<T>(items: T[], offset: number): { start: number; shown: T[]; nex
   return { start, shown: items.slice(start, start + size), nextOffset: remaining > size ? start + size : null };
 }
 
-async function showServices(ctx: BotContext, offset = 0): Promise<OutgoingMessage> {
-  const services = (await ctx.store.listServices(ctx.businessId)).filter((service) => service.active);
+async function listActiveServices(ctx: BotContext) {
+  return (await ctx.store.listServices(ctx.businessId)).filter((service) => service.active);
+}
+
+/** The services a customer can book, with duration and price. Inactive services are never listed. */
+async function showServices(
+  ctx: BotContext,
+  offset = 0,
+  notice?: string,
+  preloaded?: Awaited<ReturnType<typeof listActiveServices>>,
+): Promise<OutgoingMessage> {
+  const services = preloaded ?? (await listActiveServices(ctx));
   if (services.length === 0) return mainMenu(ctx, COPY.noServices);
 
   const page = pageOf(services, offset);
   const rows: ListRowInput[] = page.shown.map((service) => ({
     id: ID.service(service.id),
     title: service.name,
-    description: `${service.durationMinutes} min`,
+    description: serviceFacts(service.durationMinutes, service.price),
   }));
   if (page.nextOffset !== null) {
     rows.push({ id: ID.servicesPage(page.nextOffset), title: "Más servicios", description: `Quedan ${services.length - page.nextOffset} más` });
   }
-  return listMessage({ to: ctx.phone, body: "¿Qué servicio quieres agendar?", buttonLabel: "Ver servicios", rows });
+  return listMessage({
+    to: ctx.phone,
+    body: withNotice(notice, "¿Qué servicio quieres agendar?"),
+    buttonLabel: "Ver servicios",
+    rows,
+  });
+}
+
+/**
+ * Agendar. A sender the business has no name for is first asked for it (one question, kept for 10 minutes);
+ * with nothing to book there is no point in asking, so the "no services" answer comes first.
+ */
+async function startBooking(ctx: BotContext): Promise<OutgoingMessage> {
+  const services = await listActiveServices(ctx);
+  if (services.length === 0) return mainMenu(ctx, COPY.noServices);
+
+  const customer = await ctx.store.findCustomerByPhone(ctx.businessId, ctx.phone);
+  if (customer?.name?.trim()) return showServices(ctx, 0, undefined, services);
+
+  await ctx.store.startPendingName({ businessId: ctx.businessId, phone: ctx.phone, now: ctx.now });
+  return textMessage(ctx.phone, COPY.askName);
+}
+
+/**
+ * Free text. If this sender was asked for their name, the text is the answer: a valid one is saved (never over an
+ * existing name) and the service list follows; an invalid one is asked again once, then dropped. Any other text
+ * shows the main menu.
+ */
+async function handleText(ctx: BotContext, text: string): Promise<OutgoingMessage> {
+  const key = { businessId: ctx.businessId, phone: ctx.phone, now: ctx.now };
+  const name = parseCustomerName(text);
+
+  if (name !== null) {
+    const customer = await ctx.store.completePendingName({ ...key, name });
+    if (!customer) return mainMenu(ctx); // no open question (never asked, expired, or another text answered it)
+    ctx.effects.applied = true;
+    return showServices(ctx, 0, `Gracias, ${customer.name ?? name}.`);
+  }
+
+  const outcome = await ctx.store.rejectPendingName(key);
+  if (outcome === null) return mainMenu(ctx);
+  ctx.effects.applied = true;
+  return outcome === "retry" ? textMessage(ctx.phone, COPY.nameHint) : mainMenu(ctx, COPY.nameGaveUp);
 }
 
 async function showDays(ctx: BotContext, service: ActiveService, notice?: string): Promise<OutgoingMessage> {
@@ -335,7 +412,7 @@ async function slotUnavailable(
   if (own) {
     return mainMenu(
       ctx,
-      `Ya tienes esa cita agendada ✅\n\n${truncate(service.name, 80)} (${service.durationMinutes} min)\n${formatWhen(ctx.timezone, startsAt)}`,
+      `Ya tienes esa cita agendada ✅\n\n${truncate(service.name, 80)} (${serviceFacts(service.durationMinutes, service.price)})\n${formatWhen(ctx.timezone, startsAt)}`,
     );
   }
   return showSlots(ctx, service, date, 0, true);
@@ -349,7 +426,7 @@ async function confirmSlot(ctx: BotContext, serviceId: string, instant: string):
   const { service, slot, date } = check;
   return buttonsMessage({
     to: ctx.phone,
-    body: `¿Confirmas tu cita?\n\n${truncate(service.name, 80)} (${service.durationMinutes} min)\n${formatWhen(ctx.timezone, slot.startsAt)}`,
+    body: `¿Confirmas tu cita?\n\n${truncate(service.name, 80)} (${serviceFacts(service.durationMinutes, service.price)})\n${formatWhen(ctx.timezone, slot.startsAt)}`,
     buttons: [
       { id: ID.confirm(service.id, slot.startsAt), title: "Confirmar" },
       { id: ID.day(service.id, date), title: "Otro horario" },
@@ -382,7 +459,7 @@ async function book(ctx: BotContext, serviceId: string, instant: string): Promis
 
   return mainMenu(
     ctx,
-    `Tu cita quedó confirmada ✅\n\n${truncate(service.name, 80)} (${service.durationMinutes} min)\n${formatWhen(ctx.timezone, slot.startsAt)}`,
+    `Tu cita quedó confirmada ✅\n\n${truncate(service.name, 80)} (${serviceFacts(service.durationMinutes, service.price)})\n${formatWhen(ctx.timezone, slot.startsAt)}`,
   );
 }
 
@@ -410,7 +487,10 @@ async function showMyAppointments(ctx: BotContext, offset = 0): Promise<Outgoing
   const shown = upcoming.slice(0, PAGE_SIZE);
   const hasMore = upcoming.length > PAGE_SIZE;
   const lines = shown.map(
-    (appointment) => `• ${formatWhen(ctx.timezone, appointment.startsAt)} — ${truncate(appointment.serviceName, 30)}`,
+    (appointment) =>
+      `• ${formatWhen(ctx.timezone, appointment.startsAt)} — ${truncate(appointment.serviceName, 30)}${
+        appointment.servicePrice === null ? "" : ` · ${formatPrice(appointment.servicePrice)}`
+      }`,
   );
   const range = hasMore || start > 0 ? ` (${start + 1}-${start + shown.length})` : "";
   const body = `Tus próximas citas${range}:\n${lines.join("\n")}`;
@@ -506,7 +586,7 @@ async function handleReply(ctx: BotContext, id: string): Promise<OutgoingMessage
   if ((match = id.match(ID_PATTERNS.menu))) {
     switch (match[1]) {
       case "book":
-        return showServices(ctx);
+        return startBooking(ctx);
       case "mine":
         return showMyAppointments(ctx);
       case "cancel":
@@ -530,11 +610,15 @@ async function handleReply(ctx: BotContext, id: string): Promise<OutgoingMessage
 }
 
 /**
- * The stateless menu bot: one incoming message in, one reply out. Free text of any kind shows the main menu;
+ * The menu bot: one incoming message in, one reply out. Conversation state travels in the reply ids; the only
+ * server-side state is the short-lived name question. Free text shows the main menu (or answers that question);
  * a tapped reply id is parsed and validated against the database on every step, because the customer
  * controls what they send. The only identity is `ctx.phone`, the sender number.
  */
 export async function handleIncoming(ctx: BotContext, content: IncomingContent): Promise<OutgoingMessage> {
-  if (content.kind === INCOMING_KIND.TEXT) return mainMenu(ctx);
+  if (content.kind === INCOMING_KIND.TEXT) return handleText(ctx, content.body);
+
+  // Tapping anything instead of typing the name abandons the question; the tap is then handled as usual.
+  await ctx.store.clearPendingName({ businessId: ctx.businessId, phone: ctx.phone });
   return handleReply(ctx, content.id);
 }

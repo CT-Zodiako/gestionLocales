@@ -618,7 +618,7 @@ describe("agenda HTTP API", () => {
 
       expect(created.status).toBe(201);
       const service = serviceSchema.parse(await created.json());
-      expect(service).toEqual({ id: expect.any(String), name: "Corte", durationMinutes: 30, active: true });
+      expect(service).toEqual({ id: expect.any(String), name: "Corte", durationMinutes: 30, active: true, price: null });
       expect(listed.status).toBe(200);
       expect(listServicesResponseSchema.parse(await listed.json())).toEqual({ services: [service] });
     });

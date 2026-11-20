@@ -75,7 +75,7 @@ describe("WhatsApp menu bot", () => {
       const tenant = await harness.newTenant();
       const serviceId = tenant.serviceIds[0] ?? "";
       const phone = newPhone();
-      const customer = tenant.customer(phone);
+      const customer = await tenant.namedCustomer(phone, "Ana"); // a customer already named: the name step has its own tests
 
       // When - Agendar
       const services = await customer.tap("menu:book", "button_reply");
@@ -257,7 +257,7 @@ describe("WhatsApp menu bot", () => {
 
     it("shows 9 plus a Más row and reaches the remaining 3 on the next page", async () => {
       const tenant = await harness.newTenant({ services });
-      const customer = tenant.customer(newPhone());
+      const customer = await tenant.namedCustomer(newPhone(), "Ana");
 
       const first = await customer.tap("menu:book");
       const more = replyIdsOf(first).at(-1) ?? "";
@@ -857,7 +857,7 @@ describe("WhatsApp menu bot", () => {
         ],
       });
       const [first, second, third] = tenant.serviceIds;
-      const customer = tenant.customer(newPhone());
+      const customer = await tenant.namedCustomer(newPhone(), "Ana");
 
       // When
       const services = await customer.tap("menu:book");

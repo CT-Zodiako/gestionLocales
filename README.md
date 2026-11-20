@@ -85,8 +85,9 @@ Errors are `{"error": "<code>"}`.
 | `POST /api/appointments` | `{customerPhone, customerName?, serviceId, startsAt}` | `201` appointment; `endsAt` = `startsAt` + service duration; customer upserted by phone | `400 invalid_request`, `404 not_found` (service unknown or of another business), `409 slot_taken` |
 | `PATCH /api/appointments/:id` | `{startsAt}`: moves it keeping its duration | `200` appointment | `400 invalid_request`, `404 not_found` (unknown, cancelled or of another business), `409 slot_taken` |
 | `POST /api/appointments/:id/cancel` | none | `200` appointment with `status: "cancelled"` (frees the slot) | `400 invalid_request`, `404 not_found` (unknown, already cancelled or of another business) |
-| `GET /api/services` | | `200 {services:[{id,name,durationMinutes,active}]}` | |
-| `POST /api/services` | `{name, durationMinutes}` (1 to 1440) | `201` service | `400 invalid_request` |
+| `GET /api/services` | | `200 {services:[{id,name,durationMinutes,active,price}]}`; `price` is whole pesos or `null` | |
+| `POST /api/services` | `{name, durationMinutes, price?}`: `durationMinutes` 1 to 1440; `price` an integer from 0 to 100000000 (whole Colombian pesos, no cents), or `null`/absent for no price | `201` service | `400 invalid_request` |
+| `PATCH /api/services/:id` | any of `{name, durationMinutes, price, active}` (at least one), validated like create; `price: null` clears the price, `active: false` hides the service from the bot | `200` the service | `400 invalid_request` (invalid field, empty body or malformed id), `404 not_found` (unknown or of another business) |
 | `GET /api/opening-hours` | | `200 {hours:[{weekday,opensAt,closesAt}]}` ordered by weekday and opening time | |
 | `PUT /api/opening-hours` | `{hours:[{weekday,opensAt,closesAt}]}` replaces the whole week; `weekday` 0-6, times `HH:MM`, `closesAt` > `opensAt` | `200` the saved week | `400 invalid_request` |
 
@@ -105,6 +106,10 @@ Details:
 - Concurrent bookings and moves into one slot yield exactly one success and `409 slot_taken` for the
   rest: a Postgres deadlock or serialization failure is retried once and, if it persists, answered as `409`.
 - A booking that loses the overlap race (`409`) can still leave the customer row it upserted.
+- **Prices**: `services.price` is a nullable integer in whole Colombian pesos (`null` = no price shown; `0` is a
+  real price and is shown as `$0`). The field is optional on create, so old clients that never send it keep working,
+  and appointment responses do not carry it. Prices are read live: changing one also changes what "Mis citas" shows for
+  appointments already booked (the price is not frozen at booking time).
 
 Example (through nginx, after creating the owner with the CLI above):
 
@@ -114,7 +119,10 @@ curl -s -c jar -H 'content-type: application/json' -H "origin: $U" \
   -d '{"email":"owner@example.com","password":"change-me-please"}' $U/api/auth/sign-in/email
 
 curl -s -b jar -H 'content-type: application/json' \
-  -d '{"name":"Corte","durationMinutes":30}' $U/api/services          # 201 {"id":"<serviceId>",...}
+  -d '{"name":"Corte","durationMinutes":30,"price":25000}' $U/api/services   # 201 {"id":"<serviceId>",...,"price":25000}
+
+curl -s -b jar -X PATCH -H 'content-type: application/json' \
+  -d '{"price":30000}' $U/api/services/<serviceId>                    # 200; {"price":null} clears it, {"active":false} hides it
 
 curl -s -b jar -H 'content-type: application/json' \
   -d '{"customerPhone":"+57 300 123-4567","customerName":"Ana","serviceId":"<serviceId>","startsAt":"2031-03-10T14:00:00Z"}' \
@@ -249,8 +257,8 @@ sign in (they wait out a 429). Failure traces go to the system temp directory
 ## WhatsApp bot
 
 Customers book, list and cancel their appointments by chatting with the business's WhatsApp number (Cloud
-API). The API receives Meta's webhook at `/api/whatsapp/webhook` and answers with a stateless menu bot
-(reply buttons and lists). Code: `apps/api/src/whatsapp/`; the webhook payload schema is in
+API). The API receives Meta's webhook at `/api/whatsapp/webhook` and answers with a menu bot
+(reply buttons and lists; its only server-side state is the short-lived name question, see "Customer name"). Code: `apps/api/src/whatsapp/`; the webhook payload schema is in
 `packages/shared/src/whatsapp.ts`; the SQL is in `packages/db/src/whatsapp.ts`.
 
 The integration is **off by default**: with `WHATSAPP_APP_SECRET` unset the webhook routes answer `404`
@@ -308,7 +316,8 @@ template is needed; reminders are sent with approved templates, see "Reminders".
 
 ### Conversation
 
-The bot keeps no state: the state travels in the ids of the buttons and list rows, and every id is parsed
+The conversation state travels in the ids of the buttons and list rows (the one exception is the name question,
+see "Customer name"), and every id is parsed
 and checked against the database on every step (a forged or stale id, another business's service, a past slot
 or someone else's appointment is answered with "Esa opción ya no es válida." and the main menu; nothing changes).
 The customer is identified only by the sender number (`from`); a customer sees and cancels only their own
@@ -317,12 +326,12 @@ appointments.
 | Customer | Bot |
 |---|---|
 | any text (or an unknown id) | main menu: reply buttons **Agendar**, **Mis citas**, **Cancelar** |
-| Agendar | list of active services (`svc:<id>`); with more than 10, 9 services plus a **Más servicios** row (`svcs:<offset>`) for the next page |
+| Agendar | a customer with no stored name is first asked for it (see "Customer name"); then the list of active services (`svc:<id>`) with duration and price in each row (see "Prices"); with more than 10, 9 services plus a **Más servicios** row (`svcs:<offset>`) for the next page |
 | a service | list of the next 7 days that have opening hours and free slots (`day:<service>:<date>`) |
 | a day | list of free slots, 10 rows per page; with more, 9 slots plus **Más horarios** (`more:...`) |
 | a slot | confirmation buttons **Confirmar** / **Otro horario** / **Menú** |
-| Confirmar | the appointment is created and confirmed, with the menu again. If it is already the customer's own booking of that service at that time (a repeated confirmation, a stale button, a concurrent duplicate) the bot says "Ya tienes esa cita agendada" and creates nothing; if someone else took it, "Ese horario se acaba de ocupar" |
-| Mis citas | the customer's upcoming booked appointments, 10 per page; with more, a **Ver más citas** button (`mine:<offset>`) shows the next page |
+| Confirmar | the appointment is created and confirmed (service, duration and price when it has one), with the menu again. If it is already the customer's own booking of that service at that time (a repeated confirmation, a stale button, a concurrent duplicate) the bot says "Ya tienes esa cita agendada" and creates nothing; if someone else took it, "Ese horario se acaba de ocupar" |
+| Mis citas | the customer's upcoming booked appointments (with the service price when it has one), 10 per page; with more, a **Ver más citas** button (`mine:<offset>`) shows the next page |
 | Cancelar | list of the customer's upcoming appointments, 9 plus a **Más citas** row (`cmore:<offset>`) when there are more than 10, then **Sí, cancelar** / **No, volver** |
 
 Slots come from `opening_hours` minus booked appointments, in the business timezone (`businesses.timezone`,
@@ -333,6 +342,43 @@ exclusion constraint rejects it and the customer gets "Ese horario se acaba de o
 Paging offsets are plain numbers (at most 4 digits) validated like every other id: a stale offset starts the list over and a malformed one is refused. All reply ids stay far below WhatsApp's 200-character limit. Without active services, without opening hours or without free slots the bot says so. Not built:
 payments, media, free-text understanding, human handoff. There is no limit on how many appointments one
 number can book.
+
+### Prices
+
+The bot carries its own price list, so nothing depends on a Meta product catalog. A service row reads
+`30 min · $25.000` (duration, then the price with a dot as thousands separator, es-CO, no decimals); when the
+service has no price (`null`) only `30 min` is shown. The booking question, the booking confirmation, the repeated-booking
+notice and each "Mis citas" line (`• mar 11 mar, 09:00 — Corte · $25.000`) show the price too. Only **active** services
+are ever listed, so the price list cannot expose a service the business turned off. The main menu keeps its three
+reply buttons (WhatsApp allows at most 3), so there is no separate "Ver precios" button: the prices are in the service
+list that **Agendar** opens. Set prices with `POST /api/services` or `PATCH /api/services/:id` (see "Agenda API").
+
+**A Meta product catalog was deliberately not used.** It needs Commerce Manager, a catalog linked to the WhatsApp
+Business account and possibly a Meta review, and it would make the price list depend on Meta. It stays an optional
+future step (for example catalog or multi-product messages), not needed for the MVP.
+
+### Customer name
+
+The first time a sender who has no stored name taps **Agendar**, the bot asks `¿Cómo te llamas? Escribe tu nombre para continuar.`
+(only when there is something to book; with no active services it just says so). The question is stored server-side in
+`whatsapp_pending_names`, one row per business + phone, valid for 10 minutes. Then:
+
+- the **next free text** from that phone is the answer: whitespace is collapsed, it must have 2 to 60 characters, start with a
+  letter and contain only letters, spaces, apostrophes, hyphens and dots (`María-José O'Brien Jr.` is fine, digits, emojis
+  and markup are not);
+- a valid name is saved in `customers.name` (the customer row is created if missing) and the service list follows
+  ("Gracias, María José." plus the list); an **existing name is never overwritten**, not even if one appeared while the
+  question was open;
+- an invalid name is asked again once with a hint (`... entre 2 y 60 caracteres ...`); a second invalid answer drops the question
+  with "No pude guardar tu nombre. Puedes intentarlo de nuevo al tocar Agendar." and the menu;
+- tapping any button instead of typing clears the question and handles that tap normally; a question older than 10 minutes
+  is ignored (a text is then plain text and shows the menu; **Agendar** asks again);
+- two texts racing for one question: exactly one is taken as the name (the row is consumed by a single `DELETE ... RETURNING`).
+
+The stored name is what the reminder templates use (`cliente` when there is none). Idempotency by `wamid`, the signature
+check and business isolation are unchanged: the same message id twice is handled once, and a question in one business
+never applies to the same phone in another. The pending row is covered by `removeBusinessWithAgenda` and
+`removeBusinessIfUnreferenced`.
 
 WhatsApp limits respected by the message builders (`apps/api/src/whatsapp/messages.ts`; longer text is cut with
 an ellipsis `…`): button title 20 characters, at most 3 buttons, list row title 24, row description 72, list
@@ -549,10 +595,11 @@ data-layer functions: `packages/db/src/agenda.ts`.
 | Table | Contents |
 |---|---|
 | `customers` | WhatsApp customers: `phone` (E.164), optional `name`; unique per business + phone |
-| `services` | `name`, `duration_minutes` (> 0), `active` |
+| `services` | `name`, `duration_minutes` (> 0), `active`, `price` (nullable integer, whole pesos, 0 to 100000000, shown by the bot; migration 0006) |
 | `opening_hours` | weekly ranges: `weekday` 0-6, `opens_at` < `closes_at`; several ranges per weekday |
 | `appointments` | `customer_id`, `service_id`, `starts_at` < `ends_at` (`timestamptz`), `status` `booked` or `cancelled` |
 | `whatsapp_channels` | WhatsApp `phone_number_id` (unique) of a business; routes webhook messages to it |
+| `whatsapp_pending_names` | the open "what is your name?" question of a sender: primary key (`business_id`, `phone`), `attempts`, `expires_at` (10 minutes); see "Customer name" |
 | `whatsapp_processed_messages` | one row per WhatsApp `wamid` (primary key): the webhook's idempotency marker and 2-minute lease (`completed_at` is set when handling finished) |
 | `appointment_reminders` | confirmation and 24-hour reminder of each appointment: `kind`, `due_at`, `status`, `attempts`, lease and result (see "Reminders"); unique per appointment + kind |
 
@@ -614,6 +661,8 @@ pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
 | `WHATSAPP_TEMPLATE_LANGUAGE` | api | `es`; empty in compose |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | `gestion` |
 | `POSTGRES_PORT` | compose (host port) | `5433` |
+
+The price and the name step add no environment variables.
 
 The compose defaults are for local development only. Set real values for any shared or public deployment.
 
