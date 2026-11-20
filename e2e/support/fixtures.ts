@@ -101,6 +101,9 @@ export class AgendaPage {
 /** One appointment as the API lists it (only what the specs read). */
 export type ApiAppointment = { id: string; customerId: string; customerPhone: string; startsAt: string; endsAt: string; status: string };
 
+/** One service as the API lists it. */
+export type ApiService = { id: string; name: string; durationMinutes: number; active: boolean; price: number | null };
+
 /** The seeded owner's API session, to arrange and inspect data without going through the UI. */
 export class AgendaApi {
   constructor(private readonly request: APIRequestContext) {}
@@ -110,6 +113,30 @@ export class AgendaApi {
     const service = services.find((candidate) => candidate.name === name);
     if (!service) throw new Error(`Service ${name} is not seeded`);
     return service.id;
+  }
+
+  async services(): Promise<ApiService[]> {
+    const res = await this.request.get("/api/services");
+    return ((await res.json()) as { services: ApiService[] }).services;
+  }
+
+  /** The service called `name`, as the API has it now (undefined when there is none). */
+  async service(name: string): Promise<ApiService | undefined> {
+    return (await this.services()).find((candidate) => candidate.name === name);
+  }
+
+  /** Creates a service (price in whole pesos, omitted for none) and returns its id. */
+  async createService(name: string, durationMinutes: number, price?: number): Promise<string> {
+    const res = await this.request.post("/api/services", {
+      data: { name, durationMinutes, ...(price === undefined ? {} : { price }) },
+    });
+    if (!res.ok()) throw new Error(`POST /api/services failed with ${res.status()}: ${await res.text()}`);
+    return ((await res.json()) as { id: string }).id;
+  }
+
+  async updateService(id: string, patch: { name?: string; durationMinutes?: number; price?: number | null; active?: boolean }): Promise<void> {
+    const res = await this.request.patch(`/api/services/${id}`, { data: patch });
+    if (!res.ok()) throw new Error(`PATCH /api/services/${id} failed with ${res.status()}: ${await res.text()}`);
   }
 
   /** Books `service` at `time` (`HH:MM`) on `date` (`YYYY-MM-DD`, e2e timezone) and returns the appointment id. */
