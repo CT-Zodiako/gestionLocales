@@ -43,6 +43,13 @@
       "when": 1795113487611,
       "tag": "0005_appointment_reminders",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1795146848757,
+      "tag": "0006_service_price",
+      "breakpoints": true
     }
   ]
 }
