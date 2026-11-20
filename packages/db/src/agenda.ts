@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, lt } from "drizzle-orm";
+import { and, asc, eq, gt, lt, sql } from "drizzle-orm";
 import type { Database } from "./client.ts";
 import {
   APPOINTMENT_STATUS,
@@ -22,6 +22,7 @@ import {
   skipPendingReminders,
   writeClock,
   type AppointmentWriteOptions,
+  type Transaction,
 } from "./reminders.ts";
 
 /** Postgres SQLSTATE for exclusion_violation. */
@@ -66,6 +67,27 @@ async function withSlotConflicts<T>(write: () => Promise<T>): Promise<T> {
       throw error;
     }
   }
+}
+
+/** First key of the two-int32 advisory lock the agenda writers take; any fixed int32 that nothing else in this database uses ("AGND"). */
+const AGENDA_LOCK_NAMESPACE = 0x41474e44;
+
+/**
+ * Serializes the agenda-writing transactions of ONE business: takes a transaction-scoped advisory lock keyed by
+ * (`AGENDA_LOCK_NAMESPACE`, `hashtext(business id)`), so it is released by Postgres at commit or rollback and never
+ * outlives the transaction. Call it as the first statement of every transaction that inserts or re-times
+ * appointments, and never while calling anything outside the database.
+ *
+ * Why: the exclusion constraint alone is correct but not deadlock-free. Two inserts or moves into overlapping
+ * ranges each add their index entry and then wait for the other's uncommitted one, so Postgres has to detect the
+ * deadlock (1 s by default) and abort a victim, which a customer then sees as a "slot taken" they did not cause.
+ * With the lock a writer only starts after the previous one committed and sees its row, so the constraint
+ * rejects it at once and nothing waits in a cycle. The lock is per business, so other businesses are never
+ * delayed; a `hashtext` collision between two businesses only makes them take turns. Cancel-only paths free slots
+ * and never need it. The exclusion constraint stays the authority and `withSlotConflicts` the safety net.
+ */
+export async function lockBusinessAgenda(tx: Transaction, businessId: string): Promise<void> {
+  await tx.execute(sql`select pg_advisory_xact_lock(${AGENDA_LOCK_NAMESPACE}::int, hashtext(${businessId}::text))`);
 }
 
 function firstRow<T>(rows: T[], what: string): T {
@@ -201,26 +223,23 @@ export interface CreateAppointmentInput {
 }
 
 /**
- * Books a slot; throws `SlotTakenError` when it overlaps a booked appointment of the business. With
- * `options.scheduleReminders` the appointment and its reminders are written in one transaction, so a refused
- * slot leaves no reminder behind.
+ * Books a slot; throws `SlotTakenError` when it overlaps a booked appointment of the business. The write is one
+ * transaction that first takes the business's agenda lock (see `lockBusinessAgenda`); with
+ * `options.scheduleReminders` the reminders are written in it too, so a refused slot leaves no reminder behind.
  */
 export async function createAppointment(
   db: Database,
   input: CreateAppointmentInput,
   options?: AppointmentWriteOptions,
 ): Promise<Appointment> {
-  return withSlotConflicts(async () => {
-    if (!options?.scheduleReminders) {
-      const rows = await db.insert(appointments).values(input).returning();
-      return firstRow(rows, "appointment");
-    }
-    return db.transaction(async (tx) => {
+  return withSlotConflicts(async () =>
+    db.transaction(async (tx) => {
+      await lockBusinessAgenda(tx, input.businessId);
       const appointment = firstRow(await tx.insert(appointments).values(input).returning(), "appointment");
-      await scheduleAppointmentReminders(tx, appointment, writeClock(options));
+      if (options?.scheduleReminders) await scheduleAppointmentReminders(tx, appointment, writeClock(options));
       return appointment;
-    });
-  });
+    }),
+  );
 }
 
 /** A booked or cancelled appointment of the business; null when unknown or of another business. */
@@ -270,7 +289,8 @@ export async function cancelAppointment(
  * end from epoch milliseconds so the duration never depends on database interval arithmetic.
  * One atomic UPDATE: throws `SlotTakenError` when the new range overlaps another booked
  * appointment (or a deadlock persists after one retry); returns null when there is none to move
- * (unknown, cancelled or of another business). In the same transaction the 24 h reminder is re-timed (see
+ * (unknown, cancelled or of another business). The transaction first takes the business's agenda lock (see
+ * `lockBusinessAgenda`). In the same transaction the 24 h reminder is re-timed (see
  * `retimeDayBeforeReminder`); the confirmation is not re-sent for the new time.
  */
 export async function moveAppointment(
@@ -283,6 +303,7 @@ export async function moveAppointment(
 ): Promise<Appointment | null> {
   return withSlotConflicts(async () =>
     db.transaction(async (tx) => {
+      await lockBusinessAgenda(tx, businessId);
       const rows = await tx
         .update(appointments)
         .set({ startsAt: newStartsAt, endsAt: newEndsAt })

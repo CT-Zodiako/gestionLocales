@@ -104,7 +104,8 @@ Details:
 - Every instant (`startsAt`, `from`, `to`) must fall in the years 2000-2100, else `400`.
   `endsAt` is computed from epoch milliseconds, so a 24 h appointment is exactly 24 h even when moved.
 - Concurrent bookings and moves into one slot yield exactly one success and `409 slot_taken` for the
-  rest: a Postgres deadlock or serialization failure is retried once and, if it persists, answered as `409`.
+  rest: the writers of one business take turns (see "Data model"), and a Postgres deadlock or serialization
+  failure that still happens is retried once and, if it persists, answered as `409`.
 - A booking that loses the overlap race (`409`) can still leave the customer row it upserted.
 - **Prices**: `services.price` is a nullable integer in whole Colombian pesos (`null` = no price shown; `0` is a
   real price and is shown as `$0`). The field is optional on create, so old clients that never send it keep working,
@@ -640,6 +641,15 @@ constraint (`appointments_no_overlap`, `btree_gist`) rejects two non-cancelled
 appointments of the same business whose time ranges overlap. Back-to-back
 appointments (one ends when the next starts) are allowed, and cancelling frees
 the slot. `createAppointment` maps the violation to a `SlotTakenError`.
+
+Concurrency of agenda writes: `createAppointment` and `moveAppointment` run in one transaction whose first
+statement is `pg_advisory_xact_lock` keyed by a fixed namespace and the business id (`lockBusinessAgenda`), so the
+writers of one business take turns and a booking that loses a race is refused by the constraint at once instead of
+after a Postgres deadlock (about 1 s, and a wrong "slot taken" for a customer who confirmed twice). The lock is per
+business (other businesses never wait), is released by Postgres at commit or rollback, and is not needed to
+cancel. The constraint stays the final authority and the one deadlock retry stays as a safety net. Any new code
+that inserts or re-times appointments must call `lockBusinessAgenda` first in its transaction and must not
+call external services inside it.
 The constraint and the `btree_gist` extension are written by hand in
 `packages/db/migrations/0002_data_model.sql` (drizzle-kit cannot express them), so
 keep both when editing migrations and do not use `drizzle-kit push`, which does
