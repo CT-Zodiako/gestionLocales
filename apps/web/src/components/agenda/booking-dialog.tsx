@@ -14,6 +14,7 @@ import {
 } from "@/lib/appointment-forms.ts";
 import { agendaWriteMutationKey, servicesQueryOptions, useCreateAppointment } from "@/lib/appointments.ts";
 import { restoreOpener } from "@/lib/focus-return.ts";
+import { serviceOptionLabel } from "@/lib/services.ts";
 import { useAgendaStore } from "@/stores/agenda-store.ts";
 import { errorProps, FormAlert, FormField } from "./form-field.tsx";
 import { ScheduleHint } from "./schedule-hint.tsx";
@@ -140,7 +141,7 @@ function BookingForm({ prefill, onClose }: BookingFormProps) {
                 <SelectContent>
                   {activeServices.map((service) => (
                     <SelectItem key={service.id} value={service.id}>
-                      {service.name}
+                      {serviceOptionLabel(service)}
                     </SelectItem>
                   ))}
                 </SelectContent>

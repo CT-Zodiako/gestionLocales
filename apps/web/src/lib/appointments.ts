@@ -1,6 +1,7 @@
+import type { UpdateServiceBody } from "@gestion/shared";
 import { queryOptions, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useAgendaStore } from "@/stores/agenda-store.ts";
-import { ApiError, cancelAppointment, createAppointment, createService, fetchAppointments, fetchServices, moveAppointment } from "./api.ts";
+import { ApiError, cancelAppointment, createAppointment, createService, fetchAppointments, fetchServices, moveAppointment, updateService } from "./api.ts";
 import { toDateKey } from "./agenda-dates.ts";
 
 export const appointmentsQueryKey = ["appointments"];
@@ -89,5 +90,18 @@ export function useCreateService() {
     mutationKey: agendaWriteMutationKey,
     mutationFn: createService,
     onSuccess: refreshServices,
+  });
+}
+
+/** A service edit also refreshes the appointments (they show the service name), so the grid never lags behind. */
+export function useUpdateService() {
+  const { refreshAppointments, refreshServices, refreshOnNotFound } = useAgendaWrites();
+  return useMutation({
+    mutationKey: agendaWriteMutationKey,
+    mutationFn: ({ id, body }: { id: string; body: UpdateServiceBody }) => updateService(id, body),
+    onSuccess: async () => {
+      await Promise.all([refreshServices(), refreshAppointments()]);
+    },
+    onError: refreshOnNotFound,
   });
 }

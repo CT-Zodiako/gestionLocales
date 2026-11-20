@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import type { AppointmentDetailResponse } from "@gestion/shared";
-import { useIsMutating } from "@tanstack/react-query";
+import { useIsMutating, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { Button } from "@/components/ui/button.tsx";
@@ -8,8 +8,9 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input.tsx";
 import { formatDayLabel, formatTime, toDateKey, toTimeKey } from "@/lib/agenda-dates.ts";
 import { type MoveFormValues, moveFormSchema, toMoveBody, writeErrorMessage } from "@/lib/appointment-forms.ts";
-import { agendaWriteMutationKey, useCancelAppointment, useMoveAppointment } from "@/lib/appointments.ts";
+import { agendaWriteMutationKey, servicesQueryOptions, useCancelAppointment, useMoveAppointment } from "@/lib/appointments.ts";
 import { restoreOpener } from "@/lib/focus-return.ts";
+import { formatPrice } from "@/lib/services.ts";
 import { useAgendaStore } from "@/stores/agenda-store.ts";
 import { customerLabel } from "./appointment-block.tsx";
 import { errorProps, FormAlert, FormField } from "./form-field.tsx";
@@ -52,6 +53,9 @@ function DetailBody({ appointment, onClose }: DetailBodyProps) {
   const end = new Date(appointment.endsAt);
   const summary = `${appointment.serviceName} · ${formatTime(start)}–${formatTime(end)}`;
   const name = customerLabel(appointment);
+  // The price is not part of the appointment; it comes from the services list (shared cache), when there is one.
+  const services = useQuery(servicesQueryOptions());
+  const price = services.data?.find((service) => service.id === appointment.serviceId)?.price ?? null;
 
   function backToView(from: Exclude<Mode, "view">) {
     setReturnedFrom(from);
@@ -93,6 +97,12 @@ function DetailBody({ appointment, onClose }: DetailBodyProps) {
         <dd>{formatDayLabel(toDateKey(start))}</dd>
         <dt className="text-muted-foreground">Teléfono</dt>
         <dd>+{appointment.customerPhone}</dd>
+        {price !== null && (
+          <>
+            <dt className="text-muted-foreground">Precio</dt>
+            <dd data-testid="detail-price">{formatPrice(price)}</dd>
+          </>
+        )}
         <dt className="text-muted-foreground">Estado</dt>
         <dd>{cancelled ? "Cancelada" : "Agendada"}</dd>
       </dl>

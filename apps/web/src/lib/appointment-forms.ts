@@ -4,14 +4,19 @@ import {
   createAppointmentBodySchema,
   createServiceBodySchema,
   instantSchema,
+  MAX_SERVICE_PRICE,
   type MoveAppointmentBody,
   moveAppointmentBodySchema,
+  priceSchema,
   PHONE_MAX_DIGITS,
   PHONE_MIN_DIGITS,
   phoneSchema,
+  type UpdateServiceBody,
+  updateServiceBodySchema,
 } from "@gestion/shared";
 import { z } from "zod";
 import { ApiError } from "./api.ts";
+import { formatPrice } from "./services.ts";
 
 /**
  * ISO instant of a local date (`YYYY-MM-DD`) and time (`HH:MM`) in the browser timezone, or null when that wall
@@ -72,6 +77,8 @@ export const moveFormSchema = z.object(scheduleShape).superRefine(checkSchedule)
 
 export type MoveFormValues = z.infer<typeof moveFormSchema>;
 
+export const PRICE_INVALID = "El precio debe ser un número entero de pesos, sin decimales";
+export const PRICE_TOO_HIGH = `El precio no puede superar ${formatPrice(MAX_SERVICE_PRICE)}`;
 const DURATION_INVALID = "La duración debe ser un número entero de minutos entre 1 y 1440";
 
 export const serviceFormSchema = z.object({
@@ -83,9 +90,26 @@ export const serviceFormSchema = z.object({
       (value) => /^\d+$/.test(value) && createServiceBodySchema.shape.durationMinutes.safeParse(Number(value)).success,
       DURATION_INVALID,
     ),
+  // Optional: empty means no price. Whole pesos only (digits, no sign, point or comma).
+  price: z
+    .string()
+    .trim()
+    .superRefine((value, ctx) => {
+      if (value === "") return;
+      if (!/^\d+$/.test(value)) {
+        ctx.addIssue({ code: "custom", message: PRICE_INVALID });
+      } else if (!priceSchema.safeParse(Number(value)).success) {
+        ctx.addIssue({ code: "custom", message: PRICE_TOO_HIGH });
+      }
+    }),
 });
 
 export type ServiceFormValues = z.infer<typeof serviceFormSchema>;
+
+/** The edit form adds the "Activo" switch. */
+export const serviceEditFormSchema = serviceFormSchema.extend({ active: z.boolean() });
+
+export type ServiceEditFormValues = z.infer<typeof serviceEditFormSchema>;
 
 // The form schemas only add messages and the date/time pairing; what is sent is parsed by the API's own schemas.
 // (Values reaching these builders have passed the form schemas, so the parses cannot fail.)
@@ -104,13 +128,27 @@ export function toMoveBody(values: MoveFormValues): MoveAppointmentBody {
 }
 
 export function toServiceBody(values: ServiceFormValues): CreateServiceBody {
-  return createServiceBodySchema.parse({ name: values.name, durationMinutes: Number(values.durationMinutes) });
+  return createServiceBodySchema.parse({
+    name: values.name,
+    durationMinutes: Number(values.durationMinutes),
+    ...(values.price === "" ? {} : { price: Number(values.price) }),
+  });
+}
+
+/** Full PATCH body of the edit dialog: an empty price field clears the price (`null`). */
+export function toUpdateServiceBody(values: ServiceEditFormValues): UpdateServiceBody {
+  return updateServiceBodySchema.parse({
+    name: values.name,
+    durationMinutes: Number(values.durationMinutes),
+    price: values.price === "" ? null : Number(values.price),
+    active: values.active,
+  });
 }
 
 export const SLOT_TAKEN_MESSAGE = "Ese horario ya está ocupado";
 const GENERIC_MESSAGE = "Ocurrió un error. Inténtalo de nuevo.";
 
-export type WriteKind = "create" | "move" | "cancel" | "service";
+export type WriteKind = "create" | "move" | "cancel" | "service" | "service-edit";
 
 /**
  * Spanish message for a failed write. 409 is an overlap, 404 means what was acted on no longer exists
@@ -119,6 +157,7 @@ export type WriteKind = "create" | "move" | "cancel" | "service";
  */
 export function writeErrorMessage(error: unknown, kind: WriteKind): string {
   if (error instanceof ApiError) {
+    if (kind === "service-edit" && error.status === 404) return "Ese servicio ya no existe. Actualizamos la lista.";
     if (error.status === 409) return SLOT_TAKEN_MESSAGE;
     if (error.status === 404) {
       return kind === "create"

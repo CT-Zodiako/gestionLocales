@@ -1,12 +1,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { LogOut } from "lucide-react";
 import { useState } from "react";
-import { useNavigate } from "react-router";
+import { NavLink, useNavigate } from "react-router";
 import { Button } from "@/components/ui/button.tsx";
 import { signOut } from "@/lib/api.ts";
 import { meQueryOptions } from "@/lib/session.ts";
+import { cn } from "@/lib/utils.ts";
 
-/** Business name and logout. Logout keeps the T2 behavior: a failure is shown and the session and cache are kept. */
+/** Business name, logout and the links between the agenda and the services screen. Logout keeps the T2 behavior: a failure is shown and the session and cache are kept. */
 export function AgendaHeader() {
   const me = useQuery(meQueryOptions);
   const queryClient = useQueryClient();
@@ -46,11 +47,35 @@ export function AgendaHeader() {
           {isSigningOut ? "Saliendo…" : "Cerrar sesión"}
         </Button>
       </div>
+      <nav aria-label="Principal" className="flex gap-1 pt-1">
+        <HeaderLink to="/" end>
+          Agenda
+        </HeaderLink>
+        <HeaderLink to="/servicios">Servicios</HeaderLink>
+      </nav>
       {signOutError && (
         <p role="alert" className="pt-1 text-sm text-destructive">
           {signOutError}
         </p>
       )}
     </header>
+  );
+}
+
+/** A link of the header; the current one is marked with `aria-current="page"` by the router. */
+function HeaderLink({ to, end, children }: { to: string; end?: boolean; children: string }) {
+  return (
+    <NavLink
+      to={to}
+      end={end ?? false}
+      className={({ isActive }) =>
+        cn(
+          "inline-flex h-10 items-center rounded-lg px-3 text-sm font-medium outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50",
+          isActive ? "bg-muted text-foreground" : "text-muted-foreground",
+        )
+      }
+    >
+      {children}
+    </NavLink>
   );
 }

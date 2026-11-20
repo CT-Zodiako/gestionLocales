@@ -18,7 +18,7 @@ export function ServiceInlineForm({ onCreated }: { onCreated: (service: ServiceR
     formState: { errors },
   } = useForm<ServiceFormValues>({
     resolver: zodResolver(serviceFormSchema),
-    defaultValues: { name: "", durationMinutes: "" },
+    defaultValues: { name: "", durationMinutes: "", price: "" },
   });
 
   async function onSubmit(values: ServiceFormValues) {
@@ -42,7 +42,7 @@ export function ServiceInlineForm({ onCreated }: { onCreated: (service: ServiceR
         <h3 id="new-service-title" className="text-sm font-medium">
           Nuevo servicio
         </h3>
-        <p className="text-sm text-muted-foreground">Aún no tienes servicios. Crea uno para poder agendar.</p>
+        <p className="text-sm text-muted-foreground">Aún no tienes servicios activos. Crea uno para poder agendar.</p>
       </div>
       <FormField id="new-service-name" label="Nombre del servicio" error={errors.name?.message}>
         <Input id="new-service-name" autoComplete="off" {...errorProps("new-service-name", errors.name?.message)} {...register("name")} />
@@ -54,6 +54,16 @@ export function ServiceInlineForm({ onCreated }: { onCreated: (service: ServiceR
           autoComplete="off"
           {...errorProps("new-service-duration", errors.durationMinutes?.message)}
           {...register("durationMinutes")}
+        />
+      </FormField>
+      <FormField id="new-service-price" label="Precio (opcional)" error={errors.price?.message}>
+        <Input
+          id="new-service-price"
+          inputMode="numeric"
+          autoComplete="off"
+          placeholder="25000"
+          {...errorProps("new-service-price", errors.price?.message)}
+          {...register("price")}
         />
       </FormField>
       <FormAlert message={formError} />

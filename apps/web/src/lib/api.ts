@@ -13,6 +13,7 @@ import {
   meResponseSchema,
   type MoveAppointmentBody,
   type ServiceResponse,
+  type UpdateServiceBody,
   serviceSchema,
 } from "@gestion/shared";
 
@@ -121,4 +122,9 @@ export async function fetchServices(): Promise<ServiceResponse[]> {
 
 export async function createService(body: CreateServiceBody): Promise<ServiceResponse> {
   return serviceSchema.parse(await sendJson("POST", "/api/services", body));
+}
+
+/** PATCH /api/services/:id: any of name, durationMinutes, price (number or null) and active; 404 `not_found`. */
+export async function updateService(id: string, body: UpdateServiceBody): Promise<ServiceResponse> {
+  return serviceSchema.parse(await sendJson("PATCH", `/api/services/${id}`, body));
 }
