@@ -163,8 +163,33 @@ browser's timezone.
   visible range in the query key. Signing in or out clears the whole query cache,
   so a second owner in the same tab never sees the previous owner's data.
 - UI components are shadcn/ui (Radix, Tailwind 4) under `apps/web/src/components/ui`
-  (`button`, `toggle`, `toggle-group`, `dialog`, `input`, `label`, `select`); add more with
+  (`button`, `toggle`, `toggle-group`, `dialog`, `input`, `label`, `select`, `switch`); add more with
   `pnpm dlx shadcn@latest add <component>` inside `apps/web`.
+
+### Servicios
+
+The header has two links, **Agenda** (`/`) and **Servicios** (`/servicios`, protected like the agenda); the
+current one carries `aria-current="page"`. The Servicios screen lists every service of the business, active
+and inactive, with its name, duration (`30 min`), price in whole pesos formatted es-CO (`$25.000`, `Sin precio`
+when it has none; `$0` is a valid price) and state. Active services come first and the inactive ones last (each
+group by name), marked "Inactivo" and muted.
+
+- **Nuevo servicio** and **Editar** (one button per row) open the same dialog: name, duration in minutes
+  (1 to 1440), price (optional; empty means no price, digits only, up to `$100.000.000`) and, when editing, an
+  **Activo** switch. Deactivating and reactivating a service is that switch; there is no delete. Creating
+  uses `POST /api/services`; editing sends `PATCH /api/services/:id` with name, duration, price (`null` when the
+  field is emptied) and `active`. Validation reuses the shared schemas (`createServiceBodySchema`,
+  `updateServiceBodySchema`, `priceSchema` of `@gestion/shared`) through `serviceFormSchema` /
+  `serviceEditFormSchema` in `apps/web/src/lib/appointment-forms.ts`; messages are in Spanish and announced as alerts.
+- A failed write keeps the dialog open and everything typed: `404` says "Ese servicio ya no existe. Actualizamos la
+  lista." and refreshes the list, `400` and anything else (500, network) show the same messages as the appointment
+  forms. On success the dialog closes, the services (and appointments, which show the service name) queries are
+  invalidated and the list shows the change; focus returns to the button that opened the dialog.
+- The booking dialog ("Nueva cita") offers only **active** services and shows the price next to each option that has
+  one (`Corte · $25.000`); its inline "Nuevo servicio" form has the same optional price field. The appointment
+  detail dialog shows a "Precio" row when the service has a price (taken from the services list, no API change).
+  Appointment blocks are unchanged.
+- Signing out clears the whole query cache, so another owner signing in on the same tab never sees these services.
 
 ### Creating, moving and cancelling appointments
 
@@ -234,6 +259,8 @@ pnpm e2e
 
 Specs, run in alphabetical order: `e2e/agenda.spec.ts` (views, navigation, login),
 `e2e/appointments.spec.ts` (create, move, cancel, errors, keyboard and 375 px, through the real UI),
+`e2e/catalog-services.spec.ts` (the Servicios screen: list, create, edit, prices, deactivate, errors, keyboard,
+375 px, two owners; named so it sorts before `logout.spec.ts` under any collation, after `appointments.spec.ts`),
 `e2e/logout.spec.ts` (signing out ends the shared session, so it must come after the specs that use it),
 `e2e/pwa.spec.ts`.
 `e2e/appointments.spec.ts` arranges its data through the API at hours and days the other specs do not use,
