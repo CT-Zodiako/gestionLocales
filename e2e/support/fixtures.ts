@@ -1,5 +1,5 @@
 import { expect, test as base, type APIRequestContext, type Locator, type Page } from "@playwright/test";
-import { instant } from "./dates.ts";
+import { dayLabel, daysBetween, instant } from "./dates.ts";
 import { readState, type E2eState } from "./seed.ts";
 
 type Credentials = { email: string; password: string; businessName: string };
@@ -34,6 +34,21 @@ export class AgendaPage {
   async open(state: E2eState): Promise<void> {
     await this.page.goto("/");
     await expect(this.page.getByRole("heading", { level: 1, name: state.businessName })).toBeVisible();
+  }
+
+  /**
+   * In the day view, clicks "Siguiente" once per day from `from` (the date shown now) to `to`, waiting for each
+   * step to render, and checks the agenda ends on `to`. The step count comes from the dates, never from the weekday.
+   */
+  async goToDay(from: string, to: string): Promise<void> {
+    const steps = daysBetween(from, to);
+    if (steps < 0) throw new Error(`goToDay only moves forward, got ${from} -> ${to}`);
+    for (let step = 0; step < steps; step += 1) {
+      const label = await this.rangeLabel.innerText();
+      await this.next.click();
+      await expect(this.rangeLabel).not.toHaveText(label);
+    }
+    await expect(this.rangeLabel).toHaveText(dayLabel(to));
   }
 
   /** Opens the login page and signs in through the form. */

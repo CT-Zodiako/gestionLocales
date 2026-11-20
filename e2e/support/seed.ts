@@ -131,10 +131,13 @@ export async function seed(): Promise<E2eState> {
     const cancelled = await bookA(corte.id, dates.today, "15:00", "573001110003", "Clara Cita");
     await post(apiA, `/api/appointments/${cancelled.id}/cancel`);
     // Neighbouring days (navigation) and the two ends of the Monday-first week (week view columns).
+    // The week ends are at 21:00, after every hour other specs book (they book on today and tomorrow, which can be
+    // that Monday or Sunday: a 18:00 week-end booking made the 17:30-18:30 move and the 18:00 retry overlap on
+    // Monday/Sunday/Saturday runs). Nothing is seeded after today + 6 (EMPTY_DAY_OFFSET in dates.ts).
     await bookA(corte.id, dates.tomorrow, "10:00", "573001110004", "Beto Mañana");
     await bookA(corte.id, dates.yesterday, "13:00", "573001110005", "Carla Ayer");
-    await bookA(corte.id, dates.monday, "18:00", "573001110006", "Luis Lunes");
-    await bookA(corte.id, dates.sunday, "18:00", "573001110007", "Dora Domingo");
+    await bookA(corte.id, dates.monday, "21:00", "573001110006", "Luis Lunes");
+    await bookA(corte.id, dates.sunday, "21:00", "573001110007", "Dora Domingo");
 
     // Owner B: another business with a different set today (different names, hours and phones).
     apiB = await signedInApi(ownerB);

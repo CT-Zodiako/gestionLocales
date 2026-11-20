@@ -1,4 +1,4 @@
-import { addDays } from "./support/dates.ts";
+import { addDays, dayLabel, EMPTY_DAY_OFFSET } from "./support/dates.ts";
 import { anonymous, expect, test } from "./support/fixtures.ts";
 
 /** Tolerance in px for borders and sub-pixel layout. */
@@ -73,23 +73,30 @@ test.describe("agenda", () => {
   });
 
   test("a day without appointments shows the empty state", async ({ page, agenda, state }) => {
+    // Nothing is seeded after today + 6, so this day is empty on every weekday (see EMPTY_DAY_OFFSET).
+    const { today } = state.dates;
     await agenda.open(state);
-    await agenda.next.click();
-    await agenda.next.click(); // the day after tomorrow has nothing seeded
+    await agenda.goToDay(today, addDays(today, EMPTY_DAY_OFFSET));
     await expect(page.getByText("No hay citas para este día.")).toBeVisible();
     await expect(agenda.blocks()).toHaveCount(0);
   });
 
   test("an API 500 shows the error state and Reintentar recovers", async ({ page, agenda, state }) => {
+    const { today, tomorrow } = state.dates;
+    const emptyDay = addDays(today, EMPTY_DAY_OFFSET);
     await agenda.open(state);
     await agenda.next.click();
     await expect(agenda.block("Beto Mañana")).toBeVisible();
+
+    // Walk to the day before the empty one with the API healthy; only the last step runs against the failing route.
+    await agenda.goToDay(tomorrow, addDays(emptyDay, -1));
 
     let fail = true;
     await page.route(/\/api\/appointments\?/, (route) =>
       fail ? route.fulfill({ status: 500, contentType: "application/json", body: '{"error":"boom"}' }) : route.continue(),
     );
-    await agenda.next.click(); // a new range, so the query runs (and fails) again
+    await agenda.next.click(); // a day never loaded, so the query runs (and fails)
+    await expect(agenda.rangeLabel).toHaveText(dayLabel(emptyDay));
     await expect(page.getByRole("alert")).toContainText("No se pudieron cargar las citas");
     await expect(agenda.blocks()).toHaveCount(0);
 
