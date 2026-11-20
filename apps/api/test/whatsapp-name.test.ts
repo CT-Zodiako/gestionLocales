@@ -267,6 +267,28 @@ describe("customer name step in the WhatsApp bot", () => {
       }
     });
 
+    it("ignores the text at exactly 10:00.000 after the question and accepts it 1 ms earlier", async () => {
+      const tenant = await harness.newTenant();
+      const [late, early] = [newPhone(), newPhone()];
+      await tenant.customer(late).tap("menu:book");
+      await tenant.customer(early).tap("menu:book");
+
+      try {
+        harness.clock.now = new Date(baseClock.getTime() + 10 * MINUTE - 1);
+        expectServices(await tenant.customer(early).say("Ana"), tenant);
+        expect(await tenant.customerName(early)).toBe("Ana");
+        expect(await tenant.pendingNames(early)).toEqual([]);
+
+        harness.clock.now = new Date(baseClock.getTime() + 10 * MINUTE);
+        const reply = await tenant.customer(late).say("Ana");
+        expectMenu(reply);
+        expect(bodyOf(reply)).not.toContain("Gracias");
+        expect(await tenant.customerName(late)).toBeUndefined();
+      } finally {
+        harness.clock.now = baseClock;
+      }
+    });
+
     it("asks again for a fresh 10 minutes when Agendar is tapped after an expired question", async () => {
       const tenant = await harness.newTenant();
       const phone = newPhone();
@@ -432,6 +454,51 @@ describe("customer name step in the WhatsApp bot", () => {
       expect(services).toHaveLength(1);
       expect(menus).toHaveLength(1);
       expect(["Ana", "Bea"]).toContain(await tenant.customerName(phone));
+    });
+  });
+
+  describe("heavy races", () => {
+    const customerRows = async (tenant: Tenant, phone: string) =>
+      (await harness.server.db.execute(sql`select 1 from customers where business_id = ${tenant.businessId} and phone = ${phone}`)).length;
+    const gracias = (phone: string) => harness.client.messagesTo(phone).filter((message) => bodyOf(message).includes("Gracias"));
+
+    it("leaves exactly one Gracias, one customer row and no pending row when 20 different names race, in 5 rounds", { timeout: 60_000 }, async () => {
+      const tenant = await harness.newTenant();
+
+      for (let round = 0; round < 5; round++) {
+        const phone = newPhone();
+        const options = { phoneNumberId: tenant.phoneNumberId, from: phone };
+        expectPrompt(await tenant.customer(phone).tap("menu:book"));
+
+        const responses = await Promise.all(
+          Array.from({ length: 20 }, (_, n) =>
+            harness.post(textPayload({ ...options, wamid: newWamid() }, `Nombre${String.fromCharCode(65 + n)}`)),
+          ),
+        );
+
+        expect(responses.map((res) => res.status)).toEqual(Array(20).fill(200));
+        expect(gracias(phone)).toHaveLength(1);
+        expect(harness.client.messagesTo(phone)).toHaveLength(21); // the prompt, one Gracias and 19 answers as plain text
+        expect(await customerRows(tenant, phone)).toBe(1);
+        expect(await tenant.customerName(phone)).toMatch(/^Nombre[A-T]$/);
+        expect(await tenant.pendingNames(phone)).toEqual([]);
+      }
+    });
+
+    it("leaves exactly one pending row when 20 Agendar taps race", { timeout: 60_000 }, async () => {
+      const tenant = await harness.newTenant();
+      const phone = newPhone();
+      const options = { phoneNumberId: tenant.phoneNumberId, from: phone };
+
+      const responses = await Promise.all(
+        Array.from({ length: 20 }, () => harness.post(replyPayload({ ...options, wamid: newWamid() }, "menu:book", "button_reply"))),
+      );
+
+      expect(responses.map((res) => res.status)).toEqual(Array(20).fill(200));
+      expect(await tenant.pendingNames(phone)).toHaveLength(1);
+      expect(await tenant.pendingNames(phone)).toEqual([{ attempts: 0, expiresAt: new Date(baseClock.getTime() + 10 * MINUTE) }]);
+      expect(harness.client.messagesTo(phone)).toHaveLength(20);
+      expect(await customerRows(tenant, phone)).toBe(0);
     });
   });
 

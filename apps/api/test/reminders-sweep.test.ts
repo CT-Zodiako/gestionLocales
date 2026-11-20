@@ -1,5 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   cancelAppointment,
   createAppointment,
@@ -16,6 +16,9 @@ import { REMINDER_LEASE_MS, createReminderBreaker, sweepReminders } from "../src
 import { MINUTE, MONDAY_MORNING, TEMPLATES, createHarness, type Harness, type Tenant } from "./support/whatsapp-harness.ts";
 import { DAY, HOUR } from "./support/reminders.ts";
 import { FakeWhatsAppClient, templateParams } from "./support/whatsapp.ts";
+
+// These tests drive HTTP/DB round trips that stall past the 5 s default on a loaded machine.
+vi.setConfig({ testTimeout: 30_000 });
 
 const NOW = MONDAY_MORNING; // 2031-03-10T13:00:00Z
 const newPhone = () => `57300${randomInt(1_000_000, 9_999_999)}`;

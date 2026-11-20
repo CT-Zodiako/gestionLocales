@@ -19,6 +19,7 @@ import {
   removeBusinessIfUnreferenced,
   removeBusinessWithAgenda,
   setBusinessTimezone,
+  sql,
   upsertCustomer,
 } from "@gestion/db";
 import { databaseUrl } from "./support/env.ts";
@@ -129,14 +130,22 @@ describe("WhatsApp data layer", () => {
       expect(await claimWhatsappMessage(db, { wamid, businessId: business })).toBe(false);
     });
 
-    it("honours a short injected lease after it elapses", async () => {
+    /** Makes an uncompleted marker look as if it was claimed an hour ago, so no real waiting (or stall) is involved. */
+    async function ageMarker(wamid: string): Promise<void> {
+      await db.execute(sql`update whatsapp_processed_messages set received_at = now() - interval '1 hour' where wamid = ${wamid}`);
+    }
+
+    it("honours an injected lease: refused inside it, taken over once the marker is older than it", async () => {
       const business = await newBusiness();
       const wamid = `wamid.${randomUUID()}`;
       await claimWhatsappMessage(db, { wamid, businessId: business });
+      const lease = { leaseMs: 10 * 60_000 };
 
-      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 100 })).toBe(false);
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 100 })).toBe(true);
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, lease)).toBe(false);
+      await ageMarker(wamid);
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 2 * 60 * 60_000 })).toBe(false);
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, lease)).toBe(true);
+      expect(await claimWhatsappMessage(db, { wamid, businessId: business }, lease)).toBe(false);
     });
 
     it("never takes over a completed marker", async () => {
@@ -153,9 +162,12 @@ describe("WhatsApp data layer", () => {
       const business = await newBusiness();
       const wamid = `wamid.${randomUUID()}`;
       await claimWhatsappMessage(db, { wamid, businessId: business });
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await ageMarker(wamid);
 
-      const claims = await Promise.all(Array.from({ length: 20 }, () => claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 150 })));
+      // The lease (10 minutes) is far longer than any stall: the only claim that can win is the first to run.
+      const claims = await Promise.all(
+        Array.from({ length: 20 }, () => claimWhatsappMessage(db, { wamid, businessId: business }, { leaseMs: 10 * 60_000 })),
+      );
 
       expect(claims.filter(Boolean)).toHaveLength(1);
     });

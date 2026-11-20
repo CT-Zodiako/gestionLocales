@@ -274,7 +274,7 @@ describe("WhatsApp menu bot", () => {
       expect(more.length).toBeLessThanOrEqual(200);
     });
 
-    it("books every one of the 12 services end to end, including those on the second page", async () => {
+    it("books every one of the 12 services end to end, including those on the second page", { timeout: 30_000 }, async () => {
       const tenant = await harness.newTenant({ services });
       const customer = tenant.customer(newPhone());
       const pageTwo = replyIdsOf(await customer.tap("svcs:9"));
@@ -416,7 +416,7 @@ describe("WhatsApp menu bot", () => {
       expect(replyIdsOf(reply)).toEqual([`day:${serviceId}:2031-03-12`]);
     });
 
-    it("lets exactly one of two customers win when they confirm the same slot at the same time", async () => {
+    it("lets exactly one of two customers win when they confirm the same slot at the same time", { timeout: 30_000 }, async () => {
       const tenant = await harness.newTenant({ hours: [{ weekday: 2, opensAt: "08:00", closesAt: "20:00" }] });
       const serviceId = tenant.serviceIds[0] ?? "";
 
@@ -456,7 +456,7 @@ describe("WhatsApp menu bot", () => {
       expect(await tenant.appointments()).toHaveLength(1);
     });
 
-    it("answers the same way when the same customer confirms concurrently with different wamids", async () => {
+    it("answers the same way when the same customer confirms concurrently with different wamids", { timeout: 30_000 }, async () => {
       const tenant = await harness.newTenant();
       const serviceId = tenant.serviceIds[0] ?? "";
       const phone = newPhone();

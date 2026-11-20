@@ -142,6 +142,34 @@ describe("service prices and PATCH /api/services/:id", () => {
     });
   });
 
+  describe("service names on create", () => {
+    it.each([
+      ["a name of 120 characters", "x".repeat(120)],
+      ["accents and non-Latin letters", "Corte de pelo — niño 李雷"],
+      ["digits and punctuation", "Manicure + pedicure (2x1) #3"],
+    ])("accepts %s", async (_label, name) => {
+      const created = await createOk(owner, { name, durationMinutes: 30 });
+
+      expect(created.name).toBe(name);
+    });
+
+    it.each([
+      ["a name over 120 characters", "x".repeat(121)],
+      ["an empty name", ""],
+      ["a blank name", "   "],
+      ["a name with a NUL character", "Corte\u0000"],
+      ["a name with a NUL character in the middle", "Cor\u0000te"],
+      ["a name with a control character", "Cor\u0007te"],
+    ])("rejects %s with 400 and creates nothing", async (_label, name) => {
+      const before = await listServices(server.db, owner.businessId);
+
+      const res = await call(owner, "POST", "/services", { name, durationMinutes: 30 });
+
+      await expectError(res, 400, "invalid_request");
+      expect(await listServices(server.db, owner.businessId)).toHaveLength(before.length);
+    });
+  });
+
   describe("PATCH /api/services/:id", () => {
     it("sets a price and keeps every other field", async () => {
       const service = await createOk(owner, { name: "Corte", durationMinutes: 30 });
@@ -175,6 +203,15 @@ describe("service prices and PATCH /api/services/:id", () => {
       expect(serviceSchema.parse(await longer.json())).toEqual({ ...service, name: "Corte clásico", durationMinutes: 45 });
       expect(serviceSchema.parse(await off.json())).toEqual({ ...service, name: "Corte clásico", durationMinutes: 45, active: false });
       expect(serviceSchema.parse(await on.json())).toEqual({ ...service, name: "Corte clásico", durationMinutes: 45 });
+    });
+
+    it("accepts a name of exactly 120 characters", async () => {
+      const service = await createOk(owner, { name: "Corte", durationMinutes: 30 });
+
+      const res = await call(owner, "PATCH", `/services/${service.id}`, { name: "x".repeat(120) });
+
+      expect(res.status).toBe(200);
+      expect(serviceSchema.parse(await res.json()).name).toBe("x".repeat(120));
     });
 
     it("changes several fields at once", async () => {
@@ -212,9 +249,14 @@ describe("service prices and PATCH /api/services/:id", () => {
       ["a fractional price", { price: 10.5 }],
       ["a price above the maximum", { price: MAX_PRICE + 1 }],
       ["a string price", { price: "10" }],
+      ["a numeric string price", { price: "25000" }],
+      ["a boolean price", { price: true }],
       ["an empty name", { name: "" }],
       ["a blank name", { name: "   " }],
       ["a name over 120 characters", { name: "x".repeat(121) }],
+      ["a name with a NUL character", { name: "Corte\u0000" }],
+      ["a name with a NUL character in the middle", { name: "Cor\u0000te" }],
+      ["a name with a control character", { name: "Cor\u0007te" }],
       ["a zero duration", { durationMinutes: 0 }],
       ["a duration over a day", { durationMinutes: 1441 }],
       ["a fractional duration", { durationMinutes: 1.5 }],

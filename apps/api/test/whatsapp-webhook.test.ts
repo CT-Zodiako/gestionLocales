@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { claimWhatsappMessage } from "@gestion/db";
+import { claimWhatsappMessage, sql } from "@gestion/db";
 import { WhatsAppSendError } from "../src/whatsapp/client.ts";
 import { createServer, type Server } from "../src/server.ts";
 import { createWhatsAppRoutes, type WhatsAppStore } from "../src/whatsapp/webhook-routes.ts";
@@ -269,7 +269,7 @@ describe("WhatsApp webhook", () => {
       expect(sentCount()).toBe(before + 1);
     });
 
-    it("books exactly once and sends exactly one confirmation when the same confirmation arrives 10 times concurrently", async () => {
+    it("books exactly once and sends exactly one confirmation when the same confirmation arrives 10 times concurrently", { timeout: 30_000 }, async () => {
       const phone = "573001110001";
       const customer = tenant.customer(phone);
       const serviceId = tenant.serviceIds[0] ?? "";
@@ -641,14 +641,16 @@ describe("WhatsApp webhook: lease on the message marker", () => {
       expect((await harness.marker(wamid))?.completedAt).toBeInstanceOf(Date);
     });
 
-    it("lets exactly one of 20 concurrent deliveries take the marker over: one booking, one reply", async () => {
+    it("lets exactly one of 20 concurrent deliveries take the marker over: one booking, one reply", { timeout: 30_000 }, async () => {
       reset();
       const wamid = newWamid();
       const phone = "573002220011";
       const raw = confirm(wamid, phone, "2031-03-13T14:00:00.000Z");
-      harness.controls.leaseMs = 150;
+      harness.controls.leaseMs = 10 * 60_000; // far longer than any stall: only the first delivery can take the marker over
       expect(await crash(wamid)).toBe(true);
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await harness.server.db.execute(
+        sql`update whatsapp_processed_messages set received_at = now() - interval '1 hour' where wamid = ${wamid}`,
+      );
       const handledBefore = harness.logs.filter((line) => line.includes("message handled")).length;
 
       const responses = await Promise.all(Array.from({ length: 20 }, () => harness.post(null, { raw })));

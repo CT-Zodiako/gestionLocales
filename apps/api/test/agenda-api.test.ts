@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   listAppointments,
   listOpeningHours,
@@ -20,6 +20,9 @@ import {
 import { provisionOwner } from "../src/create-owner.ts";
 import { createServer, type Server } from "../src/server.ts";
 import { authSecret, authUrl, databaseUrl, uniqueEmail } from "./support/env.ts";
+
+// These tests drive HTTP/DB round trips that stall past the 5 s default on a loaded machine.
+vi.setConfig({ testTimeout: 30_000 });
 
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;

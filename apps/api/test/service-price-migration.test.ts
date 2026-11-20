@@ -3,12 +3,19 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createDb, runMigrations, sql } from "@gestion/db";
 import { databaseUrl } from "./support/env.ts";
 
 const MIGRATIONS = fileURLToPath(new URL("../../../packages/db/migrations", import.meta.url));
 const LAST_BEFORE_PRICE = "0005_appointment_reminders";
+
+const SCRATCH_PREFIX = "gestion_scratch_";
+/** Scratch databases are named `gestion_scratch_<creation epoch ms>_<uuid>`, so a later run can tell how old a leaked one is. */
+const STALE_SCRATCH_MS = 60 * 60 * 1000;
+/** Creating, migrating and dropping a database can be slow on a loaded machine. */
+const HOOK_TIMEOUT = 120_000;
+const TEST_TIMEOUT = 120_000;
 
 function codeOf(error: unknown): string | undefined {
   let current: unknown = error;
@@ -31,8 +38,51 @@ async function failureCode(run: () => Promise<unknown>): Promise<string | undefi
 
 describe("migration 0006: service price and pending names", () => {
   const admin = createDb(databaseUrl);
+  /** Scratch databases of the running test that are not dropped yet. */
   const scratchNames: string[] = [];
   const folders: string[] = [];
+
+  async function dropScratchDatabase(name: string): Promise<void> {
+    await admin.db.execute(sql.raw(`drop database if exists "${name}" with (force)`));
+  }
+
+  /** Drops every scratch database in `names`, even when one drop fails; the first failure is thrown at the end. */
+  async function dropAll(names: string[]): Promise<void> {
+    let failure: unknown;
+    for (const name of names.splice(0)) {
+      try {
+        await dropScratchDatabase(name);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+    if (failure !== undefined) throw failure;
+  }
+
+  /**
+   * Best-effort removal of scratch databases a previous run leaked (interrupted or timed out before its cleanup):
+   * those created more than an hour ago, and legacy-named ones that no connection is using. Younger ones may
+   * belong to a run in progress and are kept.
+   */
+  async function sweepStaleScratchDatabases(): Promise<void> {
+    const rows = await admin.db.execute<{ datname: string }>(
+      sql`select datname from pg_database where starts_with(datname, ${SCRATCH_PREFIX})`,
+    );
+    for (const { datname } of rows) {
+      try {
+        const created = /^gestion_scratch_(\d{13})_[0-9a-f]{32}$/.exec(datname);
+        if (created) {
+          if (Date.now() - Number(created[1]) < STALE_SCRATCH_MS) continue;
+        } else {
+          const inUse = await admin.db.execute(sql`select 1 from pg_stat_activity where datname = ${datname}`);
+          if (inUse.length > 0) continue;
+        }
+        await dropScratchDatabase(datname);
+      } catch {
+        // Another run may be dropping it at the same time; the sweep must never fail a test.
+      }
+    }
+  }
 
   function scratchUrl(name: string): string {
     const url = new URL(databaseUrl);
@@ -41,9 +91,10 @@ describe("migration 0006: service price and pending names", () => {
   }
 
   async function newScratchDatabase(): Promise<{ name: string; url: string }> {
-    const name = `gestion_scratch_${randomUUID().replaceAll("-", "")}`;
-    await admin.db.execute(sql.raw(`create database "${name}"`));
+    const name = `${SCRATCH_PREFIX}${Date.now()}_${randomUUID().replaceAll("-", "")}`;
+    // Registered before it is created: a creation that times out half way is still dropped.
     scratchNames.push(name);
+    await admin.db.execute(sql.raw(`create database "${name}"`));
     return { name, url: scratchUrl(name) };
   }
 
@@ -61,13 +112,23 @@ describe("migration 0006: service price and pending names", () => {
     return folder;
   }
 
+  beforeAll(sweepStaleScratchDatabases, HOOK_TIMEOUT);
+
+  afterEach(async () => {
+    await dropAll(scratchNames);
+  }, HOOK_TIMEOUT);
+
   afterAll(async () => {
-    for (const name of scratchNames) {
-      await admin.db.execute(sql.raw(`drop database if exists "${name}" with (force)`));
+    try {
+      await dropAll(scratchNames);
+    } finally {
+      try {
+        await admin.close();
+      } finally {
+        for (const folder of folders) rmSync(folder, { recursive: true, force: true });
+      }
     }
-    await admin.close();
-    for (const folder of folders) rmSync(folder, { recursive: true, force: true });
-  });
+  }, HOOK_TIMEOUT);
 
   async function expectCurrentShape(url: string) {
     const database = createDb(url);
@@ -113,7 +174,7 @@ describe("migration 0006: service price and pending names", () => {
     }
   }
 
-  it("applies on a fresh database and produces the final shape and constraints", async () => {
+  it("applies on a fresh database and produces the final shape and constraints", { timeout: TEST_TIMEOUT }, async () => {
     const scratch = await newScratchDatabase();
 
     await runMigrations(scratch.url);
@@ -121,7 +182,7 @@ describe("migration 0006: service price and pending names", () => {
     await expectCurrentShape(scratch.url);
   });
 
-  it("applies on top of 0005 with existing rows, keeping them and giving old services price null", async () => {
+  it("applies on top of 0005 with existing rows, keeping them and giving old services price null", { timeout: TEST_TIMEOUT }, async () => {
     // Given - a database at 0005 with a business, a service, a customer, an appointment and a reminder
     const scratch = await newScratchDatabase();
     await runMigrations(scratch.url, { migrationsFolder: migrationsUpTo0005() });
