@@ -9,6 +9,7 @@ import {
   services,
   users,
   whatsappChannels,
+  whatsappPendingNames,
   whatsappProcessedMessages,
 } from "./schema.ts";
 
@@ -69,6 +70,12 @@ export async function removeBusinessIfUnreferenced(db: Database, businessId: str
           .where(eq(appointmentReminders.businessId, businessId)),
       ),
       notExists(db.select({ id: whatsappChannels.id }).from(whatsappChannels).where(eq(whatsappChannels.businessId, businessId))),
+      notExists(
+        db
+          .select({ phone: whatsappPendingNames.phone })
+          .from(whatsappPendingNames)
+          .where(eq(whatsappPendingNames.businessId, businessId)),
+      ),
       notExists(
         db
           .select({ wamid: whatsappProcessedMessages.wamid })

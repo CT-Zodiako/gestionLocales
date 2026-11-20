@@ -9,8 +9,10 @@ import {
   customers,
   services,
   whatsappChannels,
+  whatsappPendingNames,
   whatsappProcessedMessages,
   type Appointment,
+  type Customer,
 } from "./schema.ts";
 
 /** The business a WhatsApp phone number belongs to, with what the bot needs to talk for it. */
@@ -148,6 +150,7 @@ const detailColumns = {
   customerPhone: customers.phone,
   customerName: customers.name,
   serviceName: services.name,
+  servicePrice: services.price,
 };
 
 /** Booked appointments of one customer phone that start after `from`, soonest first; `offset` skips earlier ones (paging). */
@@ -252,5 +255,119 @@ export async function cancelUpcomingAppointmentForPhone(
     if (!cancelled) return null;
     await skipPendingReminders(tx, cancelled);
     return cancelled;
+  });
+}
+
+/** How long a name question stays open. */
+export const PENDING_NAME_TTL_MS = 10 * 60_000;
+
+/** Invalid names the bot accepts before it gives up on the question (the second one ends it). */
+export const PENDING_NAME_MAX_ATTEMPTS = 2;
+
+export interface PendingNameKey {
+  businessId: string;
+  /** Sender number, digits only. */
+  phone: string;
+}
+
+/** The customer of that phone in the business, or null when there is none yet. */
+export async function findCustomerByPhone(db: Database, businessId: string, phone: string): Promise<Customer | null> {
+  const rows = await db
+    .select()
+    .from(customers)
+    .where(and(eq(customers.businessId, businessId), eq(customers.phone, phone)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/**
+ * Opens (or reopens) the name question for that sender: one row per business + phone, so asking again resets the
+ * attempts and the 10 minutes. `now` is the caller's clock.
+ */
+export async function startPendingName(db: Database, input: PendingNameKey & { now: Date }): Promise<void> {
+  const expiresAt = new Date(input.now.getTime() + PENDING_NAME_TTL_MS);
+  await db
+    .insert(whatsappPendingNames)
+    .values({ businessId: input.businessId, phone: input.phone, expiresAt })
+    .onConflictDoUpdate({
+      target: [whatsappPendingNames.businessId, whatsappPendingNames.phone],
+      set: { attempts: 0, expiresAt, createdAt: sql`now()` },
+    });
+}
+
+/** Closes the name question of that sender, if any. */
+export async function clearPendingName(db: Database, input: PendingNameKey): Promise<void> {
+  await db
+    .delete(whatsappPendingNames)
+    .where(and(eq(whatsappPendingNames.businessId, input.businessId), eq(whatsappPendingNames.phone, input.phone)));
+}
+
+/**
+ * Consumes an open name question and saves the name on the customer (created when missing), in one transaction.
+ * Only the caller that deletes the row wins, so two racing texts cannot both be taken as the name. A customer
+ * that already has a name keeps it (it is never overwritten). Returns null when no question was open.
+ */
+export async function completePendingName(
+  db: Database,
+  input: PendingNameKey & { name: string; now: Date },
+): Promise<Customer | null> {
+  return db.transaction(async (tx) => {
+    const taken = await tx
+      .delete(whatsappPendingNames)
+      .where(
+        and(
+          eq(whatsappPendingNames.businessId, input.businessId),
+          eq(whatsappPendingNames.phone, input.phone),
+          gt(whatsappPendingNames.expiresAt, input.now),
+        ),
+      )
+      .returning({ phone: whatsappPendingNames.phone });
+    if (taken.length === 0) return null;
+
+    const rows = await tx
+      .insert(customers)
+      .values({ businessId: input.businessId, phone: input.phone, name: input.name })
+      .onConflictDoUpdate({
+        target: [customers.businessId, customers.phone],
+        set: {
+          name: sql`case when ${customers.name} is null or btrim(${customers.name}) = '' then excluded.name else ${customers.name} end`,
+        },
+      })
+      .returning();
+    const customer = rows[0];
+    if (!customer) throw new Error("Could not save the customer name");
+    return customer;
+  });
+}
+
+/**
+ * Counts one invalid answer to an open question. The first leaves it open (`retry`); once
+ * `PENDING_NAME_MAX_ATTEMPTS` is reached the question is closed (`gave_up`). Returns null when no question was
+ * open. The expiry is not extended.
+ */
+export async function rejectPendingName(
+  db: Database,
+  input: PendingNameKey & { now: Date },
+): Promise<"retry" | "gave_up" | null> {
+  return db.transaction(async (tx) => {
+    const rows = await tx
+      .update(whatsappPendingNames)
+      .set({ attempts: sql`${whatsappPendingNames.attempts} + 1` })
+      .where(
+        and(
+          eq(whatsappPendingNames.businessId, input.businessId),
+          eq(whatsappPendingNames.phone, input.phone),
+          gt(whatsappPendingNames.expiresAt, input.now),
+        ),
+      )
+      .returning({ attempts: whatsappPendingNames.attempts });
+    const row = rows[0];
+    if (!row) return null;
+    if (row.attempts < PENDING_NAME_MAX_ATTEMPTS) return "retry";
+
+    await tx
+      .delete(whatsappPendingNames)
+      .where(and(eq(whatsappPendingNames.businessId, input.businessId), eq(whatsappPendingNames.phone, input.phone)));
+    return "gave_up";
   });
 }

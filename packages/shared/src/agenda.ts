@@ -100,19 +100,49 @@ export const listAppointmentsResponseSchema = z.object({
 
 export type ListAppointmentsResponse = z.infer<typeof listAppointmentsResponseSchema>;
 
-/** Body of POST /api/services. */
+/** Highest service price accepted, in whole pesos. */
+export const MAX_SERVICE_PRICE = 100_000_000;
+
+/** Price in whole Colombian pesos (no cents): an integer from 0 to 100000000. */
+export const priceSchema = z.number().int().min(0).max(MAX_SERVICE_PRICE);
+
+const serviceNameSchema = z.string().trim().min(1).max(120);
+const serviceDurationSchema = z.number().int().min(1).max(24 * 60);
+
+/** Body of POST /api/services. `price` is optional; null or absent means no price is shown. */
 export const createServiceBodySchema = z.object({
-  name: z.string().trim().min(1).max(120),
-  durationMinutes: z.number().int().min(1).max(24 * 60),
+  name: serviceNameSchema,
+  durationMinutes: serviceDurationSchema,
+  price: priceSchema.nullable().optional(),
 });
 
 export type CreateServiceBody = z.infer<typeof createServiceBodySchema>;
+
+/** Body of PATCH /api/services/:id: any of the fields (at least one); `price: null` clears the price. */
+export const updateServiceBodySchema = z
+  .object({
+    name: serviceNameSchema,
+    durationMinutes: serviceDurationSchema,
+    price: priceSchema.nullable(),
+    active: z.boolean(),
+  })
+  .partial()
+  .refine((body) => Object.values(body).some((value) => value !== undefined), {
+    message: "At least one field to change is required",
+  });
+
+export type UpdateServiceBody = z.infer<typeof updateServiceBodySchema>;
+
+/** Path parameter `:id` of the service routes. */
+export const serviceIdParamSchema = z.object({ id: z.uuid() });
 
 export const serviceSchema = z.object({
   id: z.uuid(),
   name: z.string(),
   durationMinutes: z.number().int(),
   active: z.boolean(),
+  /** Whole pesos, or null when the service shows no price. A response without the field reads as null. */
+  price: z.number().int().nullable().default(null),
 });
 
 export type ServiceResponse = z.infer<typeof serviceSchema>;
@@ -146,3 +176,17 @@ export const openingHoursSchema = z.object({
 });
 
 export type OpeningHoursResponse = z.infer<typeof openingHoursSchema>;
+
+export const CUSTOMER_NAME_MIN_LENGTH = 2;
+export const CUSTOMER_NAME_MAX_LENGTH = 60;
+
+/**
+ * A customer name typed in WhatsApp, or null when it is not acceptable: whitespace is collapsed and trimmed, then
+ * it must have 2 to 60 characters, start with a letter and contain only letters, spaces, apostrophes, hyphens and dots.
+ */
+export function parseCustomerName(raw: string): string | null {
+  const name = raw.replace(/\s+/g, " ").trim();
+  const length = [...name].length;
+  if (length < CUSTOMER_NAME_MIN_LENGTH || length > CUSTOMER_NAME_MAX_LENGTH) return null;
+  return /^\p{L}[\p{L}\p{M} '’.\-]*$/u.test(name) ? name : null;
+}

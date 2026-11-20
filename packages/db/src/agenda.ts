@@ -9,6 +9,7 @@ import {
   openingHours,
   services,
   whatsappChannels,
+  whatsappPendingNames,
   whatsappProcessedMessages,
   type Appointment,
   type Customer,
@@ -98,11 +99,46 @@ export interface CreateServiceInput {
   name: string;
   durationMinutes: number;
   active?: boolean;
+  /** Whole pesos, 0 to 100000000; null or absent means no price. */
+  price?: number | null | undefined;
 }
 
 export async function createService(db: Database, input: CreateServiceInput): Promise<Service> {
   const rows = await db.insert(services).values(input).returning();
   return firstRow(rows, "service");
+}
+
+export interface UpdateServiceInput {
+  name?: string | undefined;
+  durationMinutes?: number | undefined;
+  active?: boolean | undefined;
+  /** A number sets the price, null clears it, undefined leaves it. */
+  price?: number | null | undefined;
+}
+
+/**
+ * Changes the given fields of a service of the business and returns it; null when the id is unknown or belongs to
+ * another business. Fields that are undefined are left alone; with none, the service is returned unchanged.
+ */
+export async function updateService(
+  db: Database,
+  businessId: string,
+  serviceId: string,
+  patch: UpdateServiceInput,
+): Promise<Service | null> {
+  const changes: Partial<typeof services.$inferInsert> = {};
+  if (patch.name !== undefined) changes.name = patch.name;
+  if (patch.durationMinutes !== undefined) changes.durationMinutes = patch.durationMinutes;
+  if (patch.active !== undefined) changes.active = patch.active;
+  if (patch.price !== undefined) changes.price = patch.price;
+  if (Object.keys(changes).length === 0) return findService(db, businessId, serviceId);
+
+  const rows = await db
+    .update(services)
+    .set(changes)
+    .where(and(eq(services.id, serviceId), eq(services.businessId, businessId)))
+    .returning();
+  return rows[0] ?? null;
 }
 
 /** Services of the business, oldest first. */
@@ -300,6 +336,8 @@ export interface AppointmentDetail {
   customerPhone: string;
   customerName: string | null;
   serviceName: string;
+  /** Current price of the service in whole pesos, or null. */
+  servicePrice: number | null;
 }
 
 /** Like `listAppointments`, with the customer's phone/name and the service name. */
@@ -318,6 +356,7 @@ export async function listAppointmentDetails(
       customerPhone: customers.phone,
       customerName: customers.name,
       serviceName: services.name,
+      servicePrice: services.price,
     })
     .from(appointments)
     .innerJoin(customers, eq(customers.id, appointments.customerId))
@@ -342,6 +381,7 @@ export async function setBusinessTimezone(db: Database, businessId: string, time
 /** Deletes a business together with all its agenda data (appointments first); for cleanup and tests. */
 export async function removeBusinessWithAgenda(db: Database, businessId: string): Promise<void> {
   await db.transaction(async (tx) => {
+    await tx.delete(whatsappPendingNames).where(eq(whatsappPendingNames.businessId, businessId));
     await tx.delete(whatsappProcessedMessages).where(eq(whatsappProcessedMessages.businessId, businessId));
     await tx.delete(whatsappChannels).where(eq(whatsappChannels.businessId, businessId));
     await tx.delete(appointmentReminders).where(eq(appointmentReminders.businessId, businessId));

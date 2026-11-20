@@ -6,6 +6,7 @@ import {
   index,
   integer,
   pgTable,
+  primaryKey,
   smallint,
   text,
   time,
@@ -122,6 +123,8 @@ export const services = pgTable(
     name: text("name").notNull(),
     durationMinutes: integer("duration_minutes").notNull(),
     active: boolean("active").notNull().default(true),
+    /** Whole Colombian pesos (no cents); null means no price is shown. */
+    price: integer("price"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -129,6 +132,7 @@ export const services = pgTable(
     // Target of the composite foreign key from appointments.
     unique("services_id_business_id_unique").on(table.id, table.businessId),
     check("services_duration_minutes_positive", sql`${table.durationMinutes} > 0`),
+    check("services_price_valid", sql`${table.price} is null or (${table.price} >= 0 and ${table.price} <= 100000000)`),
   ],
 );
 
@@ -234,6 +238,29 @@ export const whatsappProcessedMessages = pgTable(
   (table) => [index("whatsapp_processed_messages_business_id_idx").on(table.businessId)],
 );
 
+/**
+ * The bot asked this sender for their name and waits for the next free text. One row per business and phone
+ * (upsert); a row past `expires_at` is ignored. The customer row may not exist yet (it is created when the name is
+ * saved), so the key is the pair business + phone rather than a foreign key to `customers`.
+ */
+export const whatsappPendingNames = pgTable(
+  "whatsapp_pending_names",
+  {
+    businessId: uuid("business_id")
+      .notNull()
+      .references(() => businesses.id),
+    phone: text("phone").notNull(),
+    /** Invalid names answered so far (the bot gives up on the second). */
+    attempts: integer("attempts").notNull().default(0),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ name: "whatsapp_pending_names_pk", columns: [table.businessId, table.phone] }),
+    check("whatsapp_pending_names_attempts_non_negative", sql`${table.attempts} >= 0`),
+  ],
+);
+
 export const REMINDER_KIND = {
   /** Sent right after the appointment is created. */
   CONFIRMATION: "confirmation",
@@ -305,4 +332,5 @@ export type Service = typeof services.$inferSelect;
 export type OpeningHour = typeof openingHours.$inferSelect;
 export type Appointment = typeof appointments.$inferSelect;
 export type WhatsappChannel = typeof whatsappChannels.$inferSelect;
+export type WhatsappPendingName = typeof whatsappPendingNames.$inferSelect;
 export type AppointmentReminder = typeof appointmentReminders.$inferSelect;
