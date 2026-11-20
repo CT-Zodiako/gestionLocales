@@ -106,7 +106,13 @@ export const MAX_SERVICE_PRICE = 100_000_000;
 /** Price in whole Colombian pesos (no cents): an integer from 0 to 100000000. */
 export const priceSchema = z.number().int().min(0).max(MAX_SERVICE_PRICE);
 
-const serviceNameSchema = z.string().trim().min(1).max(120);
+/** A service name: 1 to 120 characters once trimmed, with no control characters (Postgres cannot store NUL in text). */
+const serviceNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(120)
+  .refine((name) => !/\p{Cc}/u.test(name), { message: "The name must not contain control characters" });
 const serviceDurationSchema = z.number().int().min(1).max(24 * 60);
 
 /** Body of POST /api/services. `price` is optional; null or absent means no price is shown. */
