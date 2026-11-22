@@ -1,17 +1,201 @@
-# Gestión de citas
+# Gestión de citas: appointment manager for small businesses
 
 PWA for a business to manage appointments. Customers book and receive reminders only through WhatsApp.
 
+It is built for small service businesses (hair salons, clinics, workshops, ...) and has three parts:
+
+| Part | Who uses it | What it does |
+|---|---|---|
+| **Agenda PWA** | The business owner | Installable web app: sign in, see the day/week agenda, create, move and cancel appointments, manage services, prices and opening hours |
+| **WhatsApp booking bot** | The business's customers | A menu bot on the business's WhatsApp number: customers book, list and cancel their own appointments |
+| **Reminders** | The business's customers | A WhatsApp confirmation when an appointment is booked and a reminder 24 hours before it |
+
+The UI and the bot speak Spanish; prices are whole Colombian pesos. One deployment serves one business today,
+but every table is already scoped by `business_id`.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Tech stack](#tech-stack)
+- [Architecture](#architecture)
+- [Project status](#project-status)
+- [Project structure](#project-structure)
+- [Requirements](#requirements)
+- [Run everything in Docker](#run-everything-in-docker)
+- [Local development](#local-development)
+- [Authentication](#authentication) (including [Create the owner user](#create-the-owner-user))
+- [Agenda API](#agenda-api)
+- [Web app](#web-app) (including [End-to-end tests](#end-to-end-tests))
+- [WhatsApp bot](#whatsapp-bot)
+- [Reminders](#reminders)
+- [Data model](#data-model)
+- [Environment variables](#environment-variables)
+- [Scripts](#scripts)
+
+## Quick start
+
+You need Node 24, pnpm 12 and Docker with Compose (see [Requirements](#requirements)).
+
+### Option A: everything in Docker (fastest)
+
+```bash
+# 1. Build and start Postgres, the API and the web app (migrations run on start)
+docker compose up -d --build
+
+# 2. Create the business owner (public sign-up is disabled)
+docker compose exec api node apps/api/src/auth-cli.ts \
+  --email owner@example.com --password 'change-me-please' \
+  --name 'Owner' --business 'My Business'
+
+# 3. Check the API
+curl http://localhost:3000/api/health   # {"status":"ok","database":"up"}
+```
+
+Open http://localhost:8080/login and sign in with that email and password.
+Details: [Run everything in Docker](#run-everything-in-docker), [Create the owner user](#create-the-owner-user).
+
+### Option B: local development (hot reload)
+
+Postgres runs in Docker; the API and the web app run on your machine.
+
+```bash
+pnpm install
+docker compose up -d postgres
+
+export DATABASE_URL=postgres://gestion:gestion@localhost:5433/gestion
+export BETTER_AUTH_SECRET=dev-only-better-auth-secret-change-me-0123456789
+export BETTER_AUTH_URL=http://localhost:5173
+
+pnpm db:migrate
+pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
+  --name 'Owner' --business 'My Business'
+
+pnpm dev:api   # terminal 1: http://localhost:3000 (needs the exports above)
+pnpm dev:web   # terminal 2: http://localhost:5173 (proxies /api to :3000)
+```
+
+Open http://localhost:5173/login. Details: [Local development](#local-development),
+[Environment variables](#environment-variables).
+
+### Next steps
+
+| Goal | Where |
+|---|---|
+| Run the tests | `pnpm test` (needs `docker compose up -d postgres`), `pnpm e2e` (needs the Docker stack); see [Scripts](#scripts) and [End-to-end tests](#end-to-end-tests) |
+| Turn on the WhatsApp bot | [WhatsApp bot](#whatsapp-bot) (off by default) |
+| Turn on reminders | [Reminders](#reminders) (needs the bot plus two approved templates) |
+| Use the HTTP API directly | [Agenda API](#agenda-api) |
+
+> The secrets above and in `docker-compose.yml` are **dev-only defaults**. Set real values for any shared or
+> public deployment, and never commit WhatsApp credentials.
+
+## Tech stack
+
+Versions are the ranges declared in the `package.json` files, Dockerfiles, `docker-compose.yml` and `.nvmrc`.
+
+| Area | Technology |
+|---|---|
+| Runtime | Node.js 24 (`.nvmrc`, `engines.node >=24`); the API runs TypeScript directly (type stripping), with no build step |
+| Language | TypeScript `^7.0.2` everywhere |
+| Monorepo | pnpm `12.6.0` workspaces (`apps/*`, `packages/*`) |
+| API | Hono `^4.13.19` on `@hono/node-server` `2.1.8` |
+| Authentication | Better Auth `^1.7.25` (email + password, Drizzle adapter, sign-up disabled) |
+| Validation | Zod `^4.6.7`, schemas shared by the API and the web app (`@gestion/shared`) |
+| Database | PostgreSQL 17 (`postgres:17-alpine`), with the `btree_gist` extension for the no-overlap constraint |
+| ORM and migrations | Drizzle ORM `^0.45.4`, drizzle-kit `^0.31.11`, driver `postgres` (postgres.js) `^4.1.1` |
+| Background jobs | pg-boss `12.38.2` (reminders sweep, every minute, inside the API process) |
+| Frontend | React `^19.3.1`, React Router `^8.5.1`, TanStack Query `^5.108.0`, Zustand `^5.1.0`, React Hook Form `^7.92.0` with `@hookform/resolvers` `^7.0.7` |
+| Build tool | Vite `^8.3.8` with `@vitejs/plugin-react` `^6.3.0` |
+| UI and styling | Tailwind CSS `^4.3.5` (`@tailwindcss/vite`), shadcn/ui components (`shadcn` CLI `^4.23.0`) on `radix-ui` `^1.8.1`, `class-variance-authority`, `tw-animate-css`, `lucide-react` icons |
+| PWA | `vite-plugin-pwa` `^2.0.0` (web manifest and Workbox service worker) |
+| Messaging | WhatsApp Cloud API (Meta Graph API, `v23.0` by default), called with `fetch` (no SDK) |
+| Tests | Vitest `^5.1.0` (API unit and integration tests against Postgres), Playwright `^1.65.1` (Chromium end-to-end tests against the Docker stack) |
+| Containers | Docker Compose; images `node:24-alpine` (API, web build), `nginx:1.29-alpine` (web), `postgres:17-alpine` |
+
+## Architecture
+
+```mermaid
+flowchart LR
+  owner["Business owner<br/>browser or installed PWA"]
+  customer["Customer<br/>WhatsApp app"]
+  meta["WhatsApp Cloud API<br/>Meta Graph API"]
+
+  subgraph compose["docker compose"]
+    web["web: nginx<br/>static PWA + /api proxy<br/>port 8080"]
+    subgraph apiproc["api: one Node 24 process, port 3000"]
+      hono["Hono app /api/*<br/>auth, me, agenda routes"]
+      webhook["WhatsApp webhook + menu bot"]
+      worker["pg-boss worker<br/>reminders-sweep every minute"]
+    end
+    pg[("PostgreSQL 17<br/>app tables + pgboss schema")]
+  end
+
+  owner -->|"HTTP(S)"| web
+  web -->|"proxy /api/*"| hono
+  customer <-->|chat| meta
+  meta -->|"POST /api/whatsapp/webhook, HMAC-signed"| webhook
+  webhook -->|"replies: POST /messages"| meta
+  worker -->|"template messages"| meta
+  hono -->|"Drizzle + postgres.js"| pg
+  webhook --> pg
+  worker --> pg
+```
+
+In development the Vite dev server (port 5173) takes nginx's place and proxies `/api` to the API on port 3000.
+Meta reaches the webhook through a public HTTPS URL that points at the deployment (`https://<host>/api/whatsapp/webhook`).
+The WhatsApp webhook and the reminders worker exist only when their environment variables are set.
+
+### Packages
+
+| Package | Path | Responsibility |
+|---|---|---|
+| `@gestion/web` | `apps/web` | The owner's PWA. `src/main.tsx` and `src/router.tsx` (routes `/login`, `/`, `/servicios`, the last two behind `RequireAuth`); `src/pages/` screens; `src/components/` agenda, services and shadcn/ui components; `src/lib/` `fetch` helpers (`api.ts`) and TanStack Query hooks and form schemas; `src/stores/` Zustand UI state |
+| `@gestion/api` | `apps/api` | The HTTP API and the background worker. `src/index.ts` is the process entry (reads env, runs migrations when `RUN_MIGRATIONS=true`, starts the server and the reminders worker, handles shutdown); `src/server.ts` wires the database, Better Auth, WhatsApp and reminders into `src/app.ts`, which defines the Hono routes and the session guard; `src/agenda-routes.ts` (appointments, services, opening hours); `src/whatsapp/` (signature check, webhook, bot, Graph API client); `src/reminders/` (sweep and pg-boss worker); CLIs `src/auth-cli.ts` and `src/whatsapp-link-cli.ts` |
+| `@gestion/db` | `packages/db` | Everything that touches Postgres: `src/schema.ts` (Drizzle schema), `src/client.ts` (postgres.js + Drizzle), data-layer functions (`agenda.ts`, `whatsapp.ts`, `reminders.ts`, `owner.ts`), `src/migrate.ts` / `migrate-cli.ts` and the SQL migrations in `migrations/` |
+| `@gestion/shared` | `packages/shared` | Zod schemas and TypeScript types shared by the API and the web app: health, `/api/me`, agenda requests and responses, the WhatsApp webhook payload |
+
+Dependencies point one way: `web -> shared`, `api -> db + shared`. The web app never imports `db`.
+`createApp` receives its dependencies (auth, data access, WhatsApp client, clock) as arguments, so the tests
+run the same routes with fakes or a real test database.
+
+### Main request flows
+
+1. **Owner signs in and reads the agenda.** The PWA posts to `/api/auth/sign-in/email` (Better Auth sets the
+   session cookie), loads `/api/me` (user plus business) and then `GET /api/appointments?from&to` through
+   TanStack Query. The session guard resolves the user's business on every request; the business id is never
+   read from the request.
+2. **Owner books an appointment.** `POST /api/appointments` is validated with the shared Zod schema, then
+   `createAppointment` (in `@gestion/db`) upserts the customer and inserts the appointment in one transaction
+   under a per-business advisory lock. A Postgres exclusion constraint rejects overlaps (`409 slot_taken`).
+   When reminders are on, the same transaction schedules the confirmation and the 24-hour reminder.
+3. **Customer chats on WhatsApp.** Meta posts to `/api/whatsapp/webhook`; the API checks the
+   `X-Hub-Signature-256` HMAC, claims the message id (idempotency), finds the business by its
+   `phone_number_id`, runs the menu bot (which books through the same `createAppointment`) and replies through
+   the Graph API.
+4. **Reminders go out.** pg-boss triggers `reminders-sweep` every minute; the sweep claims due rows of
+   `appointment_reminders` one at a time, re-checks the appointment, sends the approved template and records
+   the result, with retries and backoff.
+
+The detailed rules for each flow are in [Agenda API](#agenda-api), [WhatsApp bot](#whatsapp-bot),
+[Reminders](#reminders) and [Data model](#data-model).
+
+## Project status
+
+MVP. The agenda PWA, the agenda API and authentication are covered by unit, integration and end-to-end tests.
+The WhatsApp bot and the reminders are built and tested with simulated traffic and a fake WhatsApp client only;
+delivery against the real Meta account has not been verified yet (see [WhatsApp bot](#whatsapp-bot) and
+[Reminders](#reminders)).
+
 Work plan: [`odd/tasks/agenda-whatsapp-mvp.md`](odd/tasks/agenda-whatsapp-mvp.md).
 
-## Structure
+## Project structure
 
 ```
 apps/
   web/        React + Vite PWA (React Router, TanStack Query, Zustand, shadcn/ui, Tailwind)
-  api/        Hono API (runs TypeScript directly on Node 24)
+  api/        Hono API (runs TypeScript directly on Node 24); tests in apps/api/test
 packages/
-  db/         Drizzle schema, migrations and DB client
+  db/         Drizzle schema, migrations (packages/db/migrations) and DB client
   shared/     Zod schemas and types shared by web and api
 docker/       Dockerfiles and nginx config
 e2e/          Playwright end-to-end tests (run against the Docker stack)
@@ -20,7 +204,7 @@ e2e/          Playwright end-to-end tests (run against the Docker stack)
 ## Requirements
 
 - Node 24 (`.nvmrc`)
-- pnpm 12
+- pnpm 12 (`packageManager` pins `pnpm@12.6.0`)
 - Docker with Compose
 
 ## Run everything in Docker
@@ -36,7 +220,37 @@ docker compose up -d --build
 | API | http://localhost:3000/api/health |
 | PostgreSQL | `localhost:5433` (user/password/db: `gestion`) |
 
-The API applies pending migrations on start (`RUN_MIGRATIONS=true`).
+The API applies pending migrations on start (`RUN_MIGRATIONS=true`). Compose services: `postgres`, `api`, `web`.
+Then [create the owner user](#create-the-owner-user). Useful commands:
+
+```bash
+docker compose logs -f api   # API logs (startup says whether WhatsApp and reminders are enabled)
+docker compose down          # stop the stack; data stays in the pgdata volume
+```
+
+## Local development
+
+Run only Postgres in Docker and the apps on your machine:
+
+```bash
+pnpm install
+docker compose up -d postgres
+export DATABASE_URL=postgres://gestion:gestion@localhost:5433/gestion
+export BETTER_AUTH_SECRET=dev-only-better-auth-secret-change-me-0123456789
+export BETTER_AUTH_URL=http://localhost:5173
+pnpm db:migrate
+pnpm dev:api        # http://localhost:3000
+pnpm dev:web        # http://localhost:5173 (proxies /api to :3000)
+```
+
+`BETTER_AUTH_URL` must be the origin the browser uses (the web dev server here,
+nginx in the Docker stack) so session cookies pass Better Auth's origin check.
+In local development the owner is created with:
+
+```bash
+pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
+  --name 'Dueña' --business 'Peluquería Centro'
+```
 
 ## Authentication
 
@@ -167,7 +381,7 @@ browser's timezone.
   (`button`, `toggle`, `toggle-group`, `dialog`, `input`, `label`, `select`, `switch`); add more with
   `pnpm dlx shadcn@latest add <component>` inside `apps/web`.
 
-### Servicios
+### Services screen (Servicios)
 
 The header has two links, **Agenda** (`/`) and **Servicios** (`/servicios`, protected like the agenda); the
 current one carries `aria-current="page"`. The Servicios screen lists every service of the business, active
@@ -654,30 +868,6 @@ The constraint and the `btree_gist` extension are written by hand in
 `packages/db/migrations/0002_data_model.sql` (drizzle-kit cannot express them), so
 keep both when editing migrations and do not use `drizzle-kit push`, which does
 not know about them.
-
-## Local development
-
-Run only Postgres in Docker and the apps on your machine:
-
-```bash
-pnpm install
-docker compose up -d postgres
-export DATABASE_URL=postgres://gestion:gestion@localhost:5433/gestion
-export BETTER_AUTH_SECRET=dev-only-better-auth-secret-change-me-0123456789
-export BETTER_AUTH_URL=http://localhost:5173
-pnpm db:migrate
-pnpm dev:api        # http://localhost:3000
-pnpm dev:web        # http://localhost:5173 (proxies /api to :3000)
-```
-
-`BETTER_AUTH_URL` must be the origin the browser uses (the web dev server here,
-nginx in the Docker stack) so session cookies pass Better Auth's origin check.
-In local development the owner is created with:
-
-```bash
-pnpm auth:create-user --email owner@example.com --password 'change-me-please' \
-  --name 'Dueña' --business 'Peluquería Centro'
-```
 
 ## Environment variables
 
